@@ -1,0 +1,18 @@
+[project]
+name = "espargos-iqsampling"
+version = "0.1.0"
+description = "IQ sampling addon for pyespargos"
+requires-python = ">=3.11"
+
+[project.entry-points."espargos.addons"]
+iqsampling = "espargos_iqsampling"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["espargos_iqsampling*"]
+
+[tool.black]
+line-length = 250

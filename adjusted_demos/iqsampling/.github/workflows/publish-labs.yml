@@ -1,0 +1,65 @@
+name: Publish to ESPARGOS Labs
+
+# The IQ sampling addon is distributed only through the private
+# labs.espargos.net portal, never through the public espargos.net site.
+# This workflow therefore uploads NO GitHub Actions artifact and triggers no
+# pages build: the archive goes straight to labs and nowhere else.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish-labs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        # Full history so `git describe` can name the build.
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Build addon archive
+      run: |
+        set -euo pipefail
+        version="$(git describe --tags --dirty --always)"
+        echo "ADDON_VERSION=$version" >> "$GITHUB_ENV"
+        # Stable archive name with the version in the metadata, not the
+        # filename: labs keeps a version history per filename (and prunes to
+        # the newest few), which a hash-suffixed name would defeat. Unzipping
+        # still yields a versioned directory thanks to --prefix.
+        # git archive ships only tracked files, so no .git, caches or
+        # untracked scratch files end up in the archive.
+        git archive --format=zip \
+          --prefix="pyespargos-addon-iqsampling-$version/" \
+          -o pyespargos-addon-iqsampling.zip HEAD
+        unzip -l pyespargos-addon-iqsampling.zip
+
+    - name: Verify the archive is installable
+      run: |
+        set -euo pipefail
+        # Build a wheel from the archive to catch packaging breakage before it
+        # reaches customers. --no-deps because importing the addon requires
+        # pyespargos, which lives in a separate repository.
+        python -m pip install --quiet --upgrade pip wheel
+        python -m pip wheel --no-deps --wheel-dir /tmp/verify \
+          ./pyespargos-addon-iqsampling.zip
+        ls -1 /tmp/verify/*.whl
+
+    - name: Publish to labs.espargos.net
+      env:
+        LABS_PUBLISHER_TOKEN: ${{ secrets.LABS_PUBLISHER_TOKEN }}
+      run: |
+        set -euo pipefail
+        curl -sS --fail-with-body \
+          -H "Authorization: Bearer $LABS_PUBLISHER_TOKEN" \
+          -F "version_label=$ADDON_VERSION" \
+          -F "files=@pyespargos-addon-iqsampling.zip;type=application/zip" \
+          "https://labs.espargos.net/api/collections/pyespargos-addon-iqsampling/files"
