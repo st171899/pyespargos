@@ -412,41 +412,87 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if row_count == 0 or column_count == 0:
             return
 
+        # Compress the chirps to lift the target energy out of the noise floor
+        compressed_traces = np.array([self._angle_matched_trace(corrected[ant]) for ant in range(SENSOR_COUNT)])
+        
+        # Crop the compressed streams down to the current active burst segment
+        compressed_sliced = compressed_traces[:, :valid_burst_len]
+
+        # Map the high-SNR range profiles onto your physical 2D antenna grid geometry
         spatial_samples = np.zeros((row_count, column_count, valid_burst_len), dtype=np.complex64)
         for row in range(row_count):
             for column in range(column_count):
                 antenna_id = int(geometry[row, column])
-                if 0 <= antenna_id < sliced_traces.shape[0]:
-                    spatial_samples[row, column] = sliced_traces[antenna_id]
+                if 0 <= antenna_id < compressed_sliced.shape[0]:
+                    spatial_samples[row, column] = compressed_sliced[antenna_id]
 
-        # Horizontal Angular processing space
         column_fft_size = 256
         spatial_window = np.hanning(column_count).astype(np.float32)[None, :, None]
+        
+        # Execute 1D Horizontal Azimuth FFT over the physical layout rows
         spatial_fft = np.fft.fftshift(
             np.fft.fft(spatial_samples * spatial_window, n=column_fft_size, axis=1),
             axes=1,
         )
 
-        # Max intensity projection (compress vertical rows)
-        power_map = np.sum(np.abs(spatial_fft) ** 2, axis=0)
+        # Incoherent Power Summation across both vertical rows to maximize target SNR
+        power_map = np.sum(np.abs(spatial_fft) ** 2, axis=0)  # Shape: (column_fft_size, valid_burst_len)
 
-        # FIXED: Resample/Pad the Delay/Range axis to a fixed 256x256 matrix layout
-        # This keeps texture dimensions stable regardless of changes to pings_per_256
         ui_grid_size = 256
         final_power_grid = np.zeros((column_fft_size, ui_grid_size), dtype=np.float32)
         fill_delay_bins = min(valid_burst_len, ui_grid_size)
+        
+        # Populate the 256x256 grid frame correctly: 
+        # Rows = Azimuth Steered Bins, Columns = Range Delay Bins
         final_power_grid[:, :fill_delay_bins] = power_map[:, :fill_delay_bins]
 
-        # Convert to logarithmic scaling
+        # Convert to logarithmic decibel scaling
         power_db = 10.0 * np.log10(np.maximum(final_power_grid, 1e-12))
+        
+        # Apply standard radar contrast clipping thresholds
         floor = float(np.percentile(power_db, 15.0))
         ceiling = float(np.percentile(power_db, 99.5))
         norm_map = np.clip((power_db - floor) / max(ceiling - floor, 1e-6), 0.0, 1.0)
 
-                # Apply colormap to the stabilized 256x256 grid matrix
+        # Generate the RGB/RGBA color map matrix matching pixel orientations
         colormap = matplotlib.colormaps.get_cmap("viridis")
+        
+        # Transpose norm_map to align its internal layout columns to the image coordinates
         color_data = colormap(np.transpose(norm_map)) 
         np_data = (color_data * 255).astype(np.uint8)
+
+
+        try:
+            from PIL import Image
+            # Ensure the output directory exists in your working space
+            output_dir = pathlib.Path(__file__).resolve().parent / "debug_outputs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # np_data is currently (256, 256, 4) in uint8 format (RGBA)
+            img = Image.fromarray(np_data, mode="RGBA")
+            
+            # Save with a static filename to overwrite, or append a timestamp
+            output_path = output_dir / "latest_radar_matrix.png"
+            img.save(str(output_path))
+            
+            # Optional: Log a message confirming the capture pass was successful
+            # print(f"DEBUG CAPTURE: Saved baseline texture frame to {output_path}", file=sys.stderr)
+        except Exception as img_err:
+            self.logger.error(f"Failed to dump debug radar PNG: {img_err}")
+        # =====================================================================
+
+        # Set dimensions to an absolute, stable size
+        self._radar_angle_size = 256
+        self._radar_delay_size = 256
+        self.radarConfigChanged.emit()
+
+        self._radar_status = "🟢 Processing Active: Streaming 2D Map (256x256) to GPU Shaders."
+        self.radarStatusChanged.emit()
+
+        # Flatten into a strict 262,144 byte RGBA stream (256 * 256 * 4)
+        image_vector = np_data.flatten().tolist()
+        self.radarMapChanged.emit(image_vector)
+
 
         # FIX: Align array shape metrics directly with the active property outputs
         self._radar_angle_size = int(np_data.shape[1])  # Dynamic texture columns
@@ -526,6 +572,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._angle_status = "Matched chirp window is empty."
             self.angleChanged.emit()
             return
+        
         spatial_samples = np.zeros((row_count, column_count, sample_count), dtype=np.complex64)
         for row in range(row_count):
             for column in range(column_count):
@@ -568,12 +615,10 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # intentionally has one column and must not be indexed by peak_column.
         self._elevation_estimate_deg = float(elevation_grid[peak_row, 0])
 
-        # The chart remains azimuth-only: select the strongest elevation
-        # response nearest each requested azimuth value.
 
         # 1. Collapse the vertical elevation axis using a Maximum Intensity Projection
         # This keeps the maximum target energy for every horizontal column bin
-        radar_1d_profile = np.sum(visible_power, axis=0) # Shape: (column_fft_size,)
+        radar_1d_profile = np.max(visible_power, axis=0) # Shape: (column_fft_size,)
         
         # 2. Extract the true horizontal azimuth angles for the center row of your FFT grid
         # This gives us the exact physical angles that match each of the 256 columns
@@ -585,11 +630,9 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         ui_angles = np.linspace(-90.0, 90.0, 361)
         spectrum_interp = np.interp(ui_angles, fft_native_angles, radar_1d_profile)
         
-        # 4. Normalize the spectrum safely
         max_val = np.max(spectrum_interp)
         normalized_spectrum = spectrum_interp / max_val if max_val > 0 else spectrum_interp
         
-        # 5. Commit directly to the UI spectrum (No blur filters applied!)
         self._angle_spectrum = normalized_spectrum.astype(np.float32)
         self._angle_status = "2D Spatial FFT using configured geometry and internal calibration."
         self.angleChanged.emit()

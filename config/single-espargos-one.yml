@@ -5,7 +5,7 @@
 combined-array:
   boards:
     espargosone:
-      host: myspargel.local
+      host: 10.42.0.35
       cable:
         length: 0.0
         velocity_factor: 0.76
