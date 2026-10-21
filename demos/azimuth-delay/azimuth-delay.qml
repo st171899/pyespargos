@@ -6,10 +6,17 @@ import QtQuick
 
 import "../common" as Common
 
+<<<<<<< HEAD
 Common.ESPARGOSApplication {
     id: window
     receiverDrawerComponent: Component { Common.CSIReceiverDrawer {} }
     title: "Azimuth-Delay Demo"
+=======
+Common.ESPARGOSApplication {
+    id: window
+    receiverDrawerComponent: Component { Common.WiFiTransceiverDrawer {} }
+    title: "Azimuth-Delay Demo"
+>>>>>>> main
     minimumWidth: 1024
     minimumHeight: 768
 
