@@ -45,6 +45,8 @@ import matplotlib.colors
 import PyQt6.QtCore
 import PyQt6.QtCharts
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
 import espargos  # noqa: F401 -- importing espargos loads the addon packages onto sys.path
 
 from espargos_iqsampling import CHUNK_SAMPLES, DECIM_TO_FS, IQAccumCluster, SENSOR_COUNT
@@ -189,18 +191,18 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtProperty(int, constant=True)
     def boardCount(self):
-        return len(self.pool.boards) if hasattr(self, "pool") else 1
+        return len(self.receiver.boards) if hasattr(self, "receiver") else 1
 
     @PyQt6.QtCore.pyqtProperty("QVariantList", constant=True)
     def boardHosts(self):
-        return [b.host for b in self.pool.boards] if hasattr(self, "pool") else []
+        return [b.host for b in self.receiver.boards] if hasattr(self, "receiver") else []
 
     @PyQt6.QtCore.pyqtSlot(int)
     def set_active_board(self, index):
         """Tab switch: render this board's waterfalls (only the active board
         is rendered — with 4+ boards rendering everything is too costly; the
         clusters span all boards, so switching just changes the slice)."""
-        if index == self.active_board or not hasattr(self, "pool") or not (0 <= index < len(self.pool.boards)):
+        if index == self.active_board or not hasattr(self, "receiver") or not (0 <= index < len(self.receiver.boards)):
             return
         self.active_board = index
         self.block_acc = {}
@@ -313,7 +315,7 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
             return
         self._spectrum_config_read_at = now
         try:
-            cfg = self.pool.get_config()
+            cfg = self.receiver.get_config()
             sample_rate_hz = DECIM_TO_FS.get(int(cfg.get("adc_decimation", 1)), DECIM_TO_FS[1])
             receivers = cfg.get("receivers", [])
             center_hz = float(receivers[0].get("rf_freq_hz", 2437e6)) if receivers else 2437e6
@@ -343,9 +345,9 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
         with self._pending_lock:
             clusters, self._pending_clusters = self._pending_clusters, []
         board = self.active_board
-        if not clusters or board >= len(self.pool.boards):
+        if not clusters or board >= len(self.receiver.boards):
             return []
-        revision = self.pool.boards[board].revision
+        revision = self.receiver.boards[board].revision
         positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
         sets = []
         for cluster in clusters:
@@ -353,13 +355,9 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
                 completion = cluster.section_completion
                 sections = cluster.iq_sections
                 for lane in range(cluster.vector_chunks):
-                    per = {
-                        antid: sections[board, row, col, lane]
-                        for antid, (row, col) in enumerate(positions)
-                        if completion[board, row, col, lane]
-                    }
+                    per = {antid: sections[board, row, col, lane] for antid, (row, col) in enumerate(positions) if completion[board, row, col, lane]}
                     if per:
-                        sets.append((cluster.source_chunk_start + lane, per))
+                        sets.append((cluster.chunk_index + lane, per))
             else:
                 completion = cluster.completion
                 iq = cluster.iq
@@ -473,24 +471,21 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
         """After the framework pool is up: expose the pool's QML adapter,
         subscribe the display to delivered clusters, and enter IQ mode. Sync
         (anchors from WiFi packets) BEFORE entering IQ."""
-        hosts = ", ".join(b.host for b in self.pool.boards)
-        self.logger.info(f"IQ capture starting ({len(self.pool.boards)} board(s): {hosts})")
+        hosts = ", ".join(b.host for b in self.receiver.boards)
+        self.logger.info(f"IQ capture starting ({len(self.receiver.boards)} board(s): {hosts})")
         self.iqcontrol = self.create_iq_controller()
         self.iqcontrol.set_apply_calibration(bool(self.appconfig.get("apply_calibration")))
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
         # the display also wants settled partial sets (missing sensors render
         # as placeholder rows instead of stalling the waterfall)
-        self.pool.add_iq_callback(self._on_iq_cluster, include_partial=True)
-        self.pool.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
 
         def _enter():
             try:
                 self.logger.info("acquiring array-wide time sync (this anchors all sensors' " "IQ chunk grids to one reference packet; takes a few seconds)...")
-                self.pool.sync()  # blocking, hence this worker thread
+                self.pool.calibrate()  # blocking, hence this worker thread
                 self.logger.info("time sync done, switching the array to IQ sampling mode...")
-                cfg = self.pool.get_config()
-                cfg["mode"] = "iq"
-                self.pool.apply_config(cfg)  # sensors fire on the anchored grid
                 self.logger.info("IQ mode entered; waiting for the first synchronized chunk sets...")
             except Exception as e:
                 self.logger.error(f"could not enter IQ mode: {e}")

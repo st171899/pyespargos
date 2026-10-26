@@ -15,6 +15,22 @@ AZIMUTH_DEG = np.linspace(-90.0, 90.0, 361)
 ELEVATION_DEG = np.linspace(-90.0, 90.0, 181)
 
 
+def horizontal_power(samples, frequency_hz, spacing_m, bins=256):
+    """Per-delay horizontal scan on the shader's uniform sin(angle) grid.
+
+    Steer columns coherently, then combine row powers. This measures the
+    horizontal direction cosine cos(elevation)*sin(azimuth); a true azimuth
+    needs the elevation estimate from planar_power. Use the actual k*d,
+    rather than assuming half-wavelength spacing as a bare FFT would.
+    """
+    columns = samples.shape[1]
+    u = np.linspace(-1.0, 1.0, bins)
+    phase = 2 * np.pi * frequency_hz * spacing_m / SPEED_OF_LIGHT
+    weights = np.exp(-1j * phase * u[:, None] * np.arange(columns))
+    beams = np.einsum("bc,rct->rbt", weights, samples, optimize=True)
+    return np.sum(np.abs(beams) ** 2, axis=0)
+
+
 @lru_cache(maxsize=2)
 def _steering(rows, columns, frequency_hz, spacing_m):
     azimuth = np.deg2rad(AZIMUTH_DEG)[None, :]

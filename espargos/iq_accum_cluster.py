@@ -24,12 +24,18 @@ class IQAccumCluster(SensorCluster):
     :attr:`coverage_consistent` is true.
     :attr:`config_generation` has shape ``(boards, rows, columns)`` because
     each controller maintains its own configuration counter.
+    :attr:`chunk_index` is the continuously unwrapped start on the receive
+    grid when assembled by :class:`IQReceiver`; ``source_chunk_start/end``
+    retain the exact wire indices.
     """
 
     def __init__(self, first_packet, board_revisions, gain_phase_compensation=False):
         super().__init__(board_revisions)
         self.window_index = int(first_packet.window_index)
         self.source_chunk_start = int(first_packet.source_chunk_start)
+        # IQReceiver replaces this with the unwrapped common grid index.
+        # Keep source_chunk_start/end as the exact wire metadata.
+        self.chunk_index = self.source_chunk_start
         self.source_chunk_end = int(first_packet.source_chunk_end)
         self.vector_chunks = int(first_packet.vector_chunks)
         self.nominal_chunks = int(first_packet.nominal_chunks)
@@ -51,17 +57,19 @@ class IQAccumCluster(SensorCluster):
 
     def add_message(self, board_index, sensor_message):
         payload = sensor_message.payload
-        if (
-            int(payload.window_index) != self.window_index
-            or int(payload.source_chunk_start) != self.source_chunk_start
-            or int(payload.source_chunk_end) != self.source_chunk_end
-            or int(payload.vector_chunks) != self.vector_chunks
-            or int(payload.nominal_chunks) != self.nominal_chunks
-            or int(payload.adc_decimation) != self.adc_decimation
-            or int(payload.sample_rate_hz) != self.sample_rate_hz
-            or int(payload.center_freq_hz) != self.center_freq_hz
-        ):
-            raise ClusterCollisionError("inconsistent IQ accumulation window metadata")
+        metadata_fields = (
+            "window_index",
+            "source_chunk_start",
+            "source_chunk_end",
+            "vector_chunks",
+            "nominal_chunks",
+            "adc_decimation",
+            "sample_rate_hz",
+            "center_freq_hz",
+        )
+        mismatches = [f"{field}: existing={getattr(self, field)}, incoming={int(getattr(payload, field))}" for field in metadata_fields if int(getattr(payload, field)) != getattr(self, field)]
+        if mismatches:
+            raise ClusterCollisionError("inconsistent IQ accumulation window metadata " f"from board {board_index}, antenna {int(sensor_message.antenna_id)} " f"({'; '.join(mismatches)})")
         # Generations are controller-local; only lanes on the same board
         # must agree. Different boards can share one synchronized window.
         section_present = np.any(self._section_completion[board_index], axis=-1)

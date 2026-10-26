@@ -4,7 +4,7 @@ import numpy as np
 from ..calibration import Antenna, AntennaCorrection, Calibration, CalibrationGroup, CalibrationState
 from ..iq_packet import DECIM_TO_FS
 from .reference import _map
-from ..iq_tx_control import _rpc
+from ..iq_tx_control import TXStatus, _rpc
 
 
 def snapshot(pool, tx_result=None, method="rx", scope=None):
@@ -13,7 +13,22 @@ def snapshot(pool, tx_result=None, method="rx", scope=None):
 
     scope = scope or CalibrationScope(pool)
     configs = _map(lambda b: b.iq.get_config(), pool.boards)
-    states = _map(lambda b: _rpc(b, "get_iq_tx"), pool.boards)
+    # RX needs only boot IDs. Use the live status stream when available;
+    # allocating the controller's full eight-transmitter JSON response while
+    # every sensor receives can exhaust its remaining heap.
+    session = getattr(getattr(pool, "_owner", None), "_tx", None)
+    capture = getattr(session, "capture", None)
+
+    def state(pair):
+        bi, board = pair
+        if tx_result is None and not getattr(session, "closed", False) and all(m == "iq_rx" for m in configs[bi]["modes"]) and isinstance(capture, TXStatus):
+            with capture.changed:
+                sensors = capture.status[board]
+                if all(s is not None and s["applied_mode"] == "iq_rx" for s in sensors):
+                    return {"sensors": [dict(s) for s in sensors]}
+        return _rpc(board, "get_iq_tx")
+
+    states = _map(state, enumerate(pool.boards))
     rx, tx = [], []
     if tx_result is not None:
         selected = {(bi, a) for bi, c in enumerate(configs) for a, mode in enumerate(c["modes"]) if mode == "iq_tx" and a in scope.ids[bi]}
@@ -57,7 +72,8 @@ def calibrate(pool, *, method="monitor", path="reference", scope=None, **kwargs)
 
     ``monitor`` needs a bidirectional RF path back to the master controller.
     ``reciprocity`` measures two-way sensor links; ``path`` can be ``reference``
-    (default), ``antenna_l`` or ``antenna_r``. Both methods require a shared
+    (default), ``antenna_l`` or ``antenna_r``. For multi-board TX apertures, selected IQ RX sensors temporarily send
+    reciprocal pilots as helpers, then return to RX. Both methods require a shared
     reference clock and forward RX reference. Each run uses one frequency.
     Returns a scoped :class:`Calibration`; corrections are already applied.
     """
@@ -74,6 +90,9 @@ def calibrate(pool, *, method="monitor", path="reference", scope=None, **kwargs)
 
         result = run(pool, pilot_output=path, scope=scope, **kwargs)
     try:
+        from ..iq_rx_refinement import calibrate_receivers
+
+        calibrate_receivers(pool, result["_center_hz"], scope=scope, **kwargs)
         result["path"] = path
         return snapshot(pool, result, method, scope)
     except Exception:

@@ -5,7 +5,7 @@ import QtCharts
 import QtQuick
 
 import "../demos/common" as Common
-import "../addons/iqsampling/demos/common" as IQ
+import "../demos/iq/common" as IQ
 
 Common.ESPARGOSApplication {
     id: window
@@ -156,8 +156,8 @@ Common.ESPARGOSApplication {
                 onPaint: if (imageData) getContext("2d").drawImage(imageData, 0, 0)
             }
             property variant source: ShaderEffectSource { sourceItem: plotCanvas; hideSource: true; smooth: true }
-            vertexShader: "../addons/iqsampling/demos/azimuth-delay/vertex_shader.qsb"
-            fragmentShader: "../addons/iqsampling/demos/azimuth-delay/fragment_shader.qsb"
+            vertexShader: "../demos/wifi/azimuth-delay/vertex_shader.qsb"
+            fragmentShader: "../demos/wifi/azimuth-delay/fragment_shader.qsb"
         }
     }
 

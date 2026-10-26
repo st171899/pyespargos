@@ -44,7 +44,7 @@ class DisconnectedLinks(RuntimeError):
     """Accepted reciprocal measurements do not connect the selected sensors."""
 
     def __init__(self, components):
-        super().__init__("Reciprocal links do not connect every selected transmitter")
+        super().__init__(f"Reciprocal links do not connect every selected transmitter (components={components})")
         self.components = components
 
 

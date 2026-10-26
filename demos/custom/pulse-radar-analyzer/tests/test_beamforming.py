@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from beamforming import AZIMUTH_DEG, ELEVATION_DEG, SPEED_OF_LIGHT, planar_power
+from beamforming import AZIMUTH_DEG, ELEVATION_DEG, SPEED_OF_LIGHT, planar_power, horizontal_power
 
 
 class BeamformingTest(unittest.TestCase):
@@ -48,6 +48,16 @@ class BeamformingTest(unittest.TestCase):
         # At half-wave spacing, azimuth +/-30 degrees maps to FFT +/-1/4.
         self.assertAlmostEqual(power[90, 240], fft_power[0, 1])
         self.assertAlmostEqual(power[90, 120], fft_power[0, 3])
+
+    def test_heatmap_uses_rf_wavelength_for_horizontal_direction(self):
+        u = np.linspace(-1, 1, 256)
+        for frequency in (2.31e9, 2.437e9, 2.64e9):
+            for index in (45, 127, 201):
+                phase = 2 * np.pi * frequency * 0.06 / SPEED_OF_LIGHT
+                samples = np.tile(np.exp(1j * phase * u[index] * np.arange(4))[None, :, None], (2, 1, 3))
+                power = horizontal_power(samples, frequency, 0.06)
+                self.assertEqual(np.argmax(power[:, 1]), index)
+                self.assertAlmostEqual(power[index, 1], 32)
 
 
 if __name__ == "__main__":

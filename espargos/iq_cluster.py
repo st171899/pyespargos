@@ -122,8 +122,10 @@ class IQCluster(SensorCluster):
         This permits comparing capture starts at different sample rates.
         """
         base = (self._source_chunk_index.astype(np.int64) - self._chunk_counter) & 0xFFFFFF
-        offset_ns = np.divide(base * 256e9, self._sample_rate_hz, out=np.zeros(self.shape), where=self._sample_rate_hz != 0)
-        return self._fire_time_ns.astype(np.int64) - np.rint(offset_ns).astype(np.int64)
+        valid = self._completion & (self._sample_rate_hz > 0)
+        origin = np.zeros(self.shape, dtype=np.int64)
+        origin[valid] = self._fire_time_ns[valid].astype(np.int64) - np.rint(base[valid] * 256e9 / self._sample_rate_hz[valid]).astype(np.int64)
+        return origin
 
     @property
     def host_timestamp(self) -> float:

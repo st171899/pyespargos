@@ -8,6 +8,7 @@ separately in ``reciprocity_fit``.
 """
 
 import numpy as np
+from ..iq_tx_control import CalibrationMeasurementError
 
 
 def _phase_fit(k, phase, n):
@@ -76,8 +77,8 @@ def measure(monitor, models, timeout):
         if len(fits) >= 6:
             break
     if len(fits) < 6:
-        raise RuntimeError(f"Not enough clean monitor captures: {last_error}")
+        raise CalibrationMeasurementError(f"Not enough clean monitor captures: {last_error}")
     phases = np.exp(1j * np.array([f[0] for f in fits])).mean(axis=0)
     if np.any(abs(phases) < 0.99):
-        raise RuntimeError("Monitor pilot phase is not stable")
+        raise CalibrationMeasurementError("Monitor pilot phase is not stable")
     return np.angle(phases), np.mean([f[1] for f in fits], axis=0)

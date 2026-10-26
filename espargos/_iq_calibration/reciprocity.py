@@ -17,7 +17,7 @@ The boards must share their sample clock and REF source.
 import copy
 from .reference import _map
 from .reciprocity_fit import DisconnectedLinks, additional_reference, fit_links, validate_links
-from ..iq_tx_control import TXStatus, _rpc, _wait, _waveform
+from ..iq_tx_control import CalibrationMeasurementError, TXStatus, _rpc, _wait, _waveform
 
 
 import numpy as np
@@ -31,12 +31,32 @@ def _transmitter_settings(state):
     return [{key: sensor[key] for key in keys} for sensor in state["sensors"]]
 
 
+def _restore_pilots(board, board_index, pilots, saved_tx, timeout, wait):
+    """Restore prepared replay sources, including RX helpers' dormant buffers.
+
+    Calibration pilots use a temporary buffer. A helper without a saved replay
+    source stays in RX; it has no source waveform to restore.
+    """
+    groups = {}
+    for bi, antenna in sorted(pilots):
+        if bi == board_index:
+            samples = saved_tx[bi]["sensors"][antenna]["samples"]
+            if samples:
+                groups.setdefault(samples, []).append(antenna)
+    for samples, antennas in groups.items():
+        _waveform(board, {"type": "restore", "samples": samples, "antennas": antennas}, timeout, wait=wait)
+
+
 def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=None, timeout=10.0, pilot_output="reference", scope=None):
     """Calibrate the currently selected transmitters and restore RX/TX operation.
 
     Selected transmitters need a waveform with a common replay length and
     center frequency. Active receivers must use that frequency too. This
     preserves uploaded/synthesized waveforms, gain, steering and mute settings.
+    For multi-board apertures, selected IQ RX sensors join the reciprocal measurements
+    as temporary pilot helpers.
+    Cross-board helper links can connect TX sensors whose same-board REF paths
+    are isolated. Only the original TX selection receives TX corrections.
     On failure transmitters become silent receivers, and calibration is invalid.
 
     Returns per-board calibration dictionaries and link-fit residuals. The
@@ -79,11 +99,16 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
     bins = np.array([k for k in range(-period * 3 // 16, period * 3 // 16 + 1) if abs(k) >= 8])
     owners = np.where(abs(bins) == period // 16 + 1, 0, abs(bins) % 8)
     frequencies = bins * 80e6 / period
-    target_ids = [8 * bi + a for bi, a in targets]
-    positions = [(bi, *boards[bi].revision.antenna_id_to_row_col(a)) for bi, a in targets]
+    # Keep selected transmitters first so the fitted reference remains a TX
+    # sensor. Receive-only boards must also send pilots: their reciprocal
+    # links bridge isolated splitter branches on the selected TX board.
+    helpers = receivers if len(boards) > 1 and len(targets) > 1 else []
+    participants = targets + helpers
+    target_ids = [8 * bi + a for bi, a in participants]
+    positions = [(bi, *boards[bi].revision.antenna_id_to_row_col(a)) for bi, a in participants]
     initial_corrections = [copy.deepcopy(s["calibration"]) for s in saved_tx]
     steering = [copy.deepcopy(s["steering"]) for s in saved_tx]
-    for bi, a in targets:
+    for bi, a in participants:
         for table in (initial_corrections[bi], steering[bi]):
             for values in table.values():
                 values[a] = 0
@@ -105,7 +130,7 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
                     "modes": rx_modes[bi],
                     "calibration": initial_corrections[bi],
                     "steering": steering[bi],
-                    "transmitters": [{"antid": a, "rf_gain": {"a": 0, "b": 0}, "bandwidth_mhz": 40} for j, a in targets if j == bi]
+                    "transmitters": [{"antid": a, "frequency_hz": center, "rf_gain": {"a": 0, "b": 0}, "bandwidth_mhz": 40} for j, a in participants if j == bi]
                     + [{"antid": a, "amplitude": 0} for a, mode in enumerate(saved_rx[bi]["modes"]) if mode == "iq_tx" and a not in scope.ids[bi]],
                 },
             )
@@ -142,7 +167,7 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
         paths = np.array([rx_cal.reference_path_delays[p] for p in positions])
         paths -= paths[0]
         boot_ids = [[x["boot_id"] for x in state["sensors"]] for state in saved_tx]
-        count = len(targets)
+        count = len(participants)
         response = np.zeros((len(bins), count, count), complex)
         valid = np.zeros(response.shape, bool)
         validation = np.zeros_like(response)
@@ -151,14 +176,23 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
         # board's remaining sensors transmit orthogonal combs in one capture.
         hubs = [0]
         if count > 1:
-            hubs.append(next((i for i, (bi, _) in enumerate(targets) if bi != targets[0][0]), 1))
+            hubs.append(next((i for i, (bi, _) in enumerate(participants) if bi != participants[0][0]), 1))
         groups = [[i] for i in hubs]
-        groups += [[i for i, (j, _) in enumerate(targets) if j == bi and i not in hubs] for bi in range(len(boards))]
-        groups = [g for g in groups if g]
+        groups += [[i for i, (j, _) in enumerate(participants) if j == bi and i not in hubs] for bi in range(len(boards))]
+        # Firmware assigns comb slots by ascending antenna ID in its mask,
+        # not by our target/helper ordering (which puts selected TXs first).
+        groups = [sorted(g, key=lambda i: participants[i][1]) for g in groups if g]
+
+        def receive_ready():
+            # RX mode status can precede completion of an engine restart after
+            # restoring capture settings. Fresh chunks from the current
+            # generation prove every buffer can safely change replay length.
+            generations = _map(lambda b: b.iq.get_config()["config_generation"], boards)
+            capture.collect(target_ids, 256, 1, timeout, {8 * bi + a: generations[bi] for bi, a in participants})
 
         def prepare_group(group, dense):
-            bi = targets[group[0]][0]
-            ants = [targets[i][1] for i in group]
+            bi = participants[group[0]][0]
+            ants = [participants[i][1] for i in group]
             pilots.update((bi, a) for a in ants)
             # Dense pilots spread their power over eight times as many tones.
             amplitude = 0.1
@@ -172,16 +206,21 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
             )
 
         def prepare_pilots(bi):
+            # Controller configuration can precede the sensor role change.
+            # A length-changing pilot requires a stopped replay, including
+            # receive-only helpers with dormant user waveform buffers.
+            _wait(boards[bi], lambda s: all(s["sensors"][a]["applied_mode"] == "iq_rx" and not s["sensors"][a]["enabled"] for a in scope.ids[bi]), timeout)
             for group in groups:
-                if targets[group[0]][0] == bi:
+                if participants[group[0]][0] == bi:
                     prepare_group(group, group[0] in hubs)
 
-        _map(prepare_pilots, range(len(boards)))
+        receive_ready()
+        _map(prepare_pilots, scope.active)
 
         def measure(group, dense):
-            bi = targets[group[0]][0]
+            bi = participants[group[0]][0]
             board = boards[bi]
-            ants = [targets[i][1] for i in group]
+            ants = [participants[i][1] for i in group]
             receiving = [i for i in range(count) if i not in group]
             pool._logger.info("TX calibration: simultaneous sensors %s/%s", board.host, ants)
             _rpc(
@@ -253,7 +292,7 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
                 candidate = additional_reference(error.components, hubs, valid & validation_valid)
                 if candidate is None or extra_references >= 2:
                     raise
-                pool._logger.info("TX calibration: adding reference sensor %s", targets[candidate])
+                pool._logger.info("TX calibration: adding reference sensor %s", participants[candidate])
                 hubs.append(candidate)
                 prepare_group([candidate], True)
                 measure([candidate], True)
@@ -268,14 +307,14 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
         quality.update({"validation_" + key: value for key, value in checked.items()})
         quality["additional_references"] = extra_references
         if any(q["phase_residual_deg"] > 5 or q["delay_residual_samples"] > 0.3 for q in (quality, checked)):
-            raise RuntimeError(f"Reciprocal calibration did not validate: {quality}")
+            raise CalibrationMeasurementError(f"Reciprocal calibration did not validate: {quality}")
+
+        receive_ready()
 
         def restore(pair):
             bi, b = pair
             capture.wait(b, lambda s: all(s["sensors"][a]["applied_mode"] == "iq_rx" for a in scope.ids[bi]), timeout)
-            ants = [a for j, a in pilots if j == bi]
-            if ants:
-                _waveform(b, {"type": "restore", "samples": length, "antennas": ants}, timeout, wait=capture.wait)
+            _restore_pilots(b, bi, pilots, saved_tx, timeout, capture.wait)
             _rpc(
                 b,
                 "set_iq_tx",
@@ -314,6 +353,10 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
             )
         )
         latency = np.array([((final[bi]["sensors"][a]["origin_ns"] - int(reference[i]) + length * 6.25) % (length * 12.5) - length * 6.25) / 12.5 for i, (bi, a) in enumerate(targets)])
+        # Helpers have returned to RX and have no TX replay origin to fit.
+        # Publish corrections and epoch checks only for the requested TXs.
+        phase = phase[: len(targets)]
+        delay = delay[: len(targets)].copy()
         delay -= latency - latency[0]
         corrections = [copy.deepcopy(s["calibration"]) for s in saved_tx]
         for i, (bi, a) in enumerate(targets):
@@ -383,7 +426,7 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
                     ants = [a for j, a in pilots if j == bi]
                     if ants:
                         _wait(b, lambda state: all(state["sensors"][a]["applied_mode"] == "iq_rx" for a in ants), timeout)
-                        _waveform(b, {"type": "restore", "samples": length, "antennas": ants}, timeout)
+                        _restore_pilots(b, bi, pilots, saved_tx, timeout, _wait)
                     _rpc(
                         b,
                         "set_iq_tx",

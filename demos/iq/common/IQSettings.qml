@@ -151,11 +151,12 @@ GridLayout {
 		Layout.columnSpan: 2
 		Layout.fillWidth: true
 		text: "Sync + Calibration"
+		enabled: controller && !controller.referenceBusy
 		Material.background: !controller || controller.syncNeeded ? "#c53d3d" : "#227b3d"
 		Material.foreground: "#ffffff"
 		onClicked: if (controller) controller.sync_async()
 		ToolTip.visible: hovered
-		ToolTip.text: "Synchronize and calibrate all sensors using broadband REF at fixed gain and transmit power, verify the result, then restore receive settings."
+		ToolTip.text: "Synchronize and calibrate the configured RX/TX sensors, verify the result, and restore capture settings. In the radar demo this applies the selected transmission setup, even with TX stopped."
 	}
 
 	Label { Layout.columnSpan: 2; text: "Corrections"; color: "#9fb3c8" }

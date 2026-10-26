@@ -48,10 +48,15 @@ class IQController(PyQt6.QtCore.QObject):
         pool: Pool,
         logger=None,
         parent=None,
+        sync_operation=None,
+        config_operation=None,
     ):
         super().__init__(parent)
         self.pool = pool
         self.receiver = pool.iq
+        self._sync_operation = sync_operation
+        self._config_operation = config_operation
+        self.calibration_guard = None
         self.logger = logger if logger is not None else logging.getLogger("pyespargos.iq_application")
         # GUI toggle: apply the fine calibration to displayed data
         self.apply_calibration = False
@@ -81,8 +86,11 @@ class IQController(PyQt6.QtCore.QObject):
             self.syncNeededChanged.emit()
 
     def _observe_capture(self, capture):
-        if not self._reference_busy and not self.receiver.calibration_applies_to(capture):
-            self._set_sync_needed(True)
+        if not self._reference_busy:
+            valid = self.receiver.calibration_applies_to(capture)
+            if self.calibration_guard is not None:
+                valid = valid and self.calibration_guard()
+            self._set_sync_needed(not valid)
 
     def _check_calibration_config(self, config):
         center = self.receiver.calibration_center_frequency
@@ -118,21 +126,24 @@ class IQController(PyQt6.QtCore.QObject):
             return
         try:
             config = json.loads(config_json)
-            capture = dict(config)
-            radio = {}
-            for source, target in (("rf_freq_hz", "frequency_hz"), ("rx_gain", "rx_gain"), ("gain_mode", "gain_mode")):
-                if source in capture:
-                    radio[target] = capture.pop(source)
-            if isinstance(radio.get("gain_mode"), int):
-                radio["gain_mode"] = ("auto", "manual", "expert")[radio["gain_mode"]]
-            if "adc_decimation" in capture:
-                radio["sample_rate_hz"] = DECIM_TO_FS[capture.pop("adc_decimation")]
-            if "rf_switch" in capture:
-                radio["output"] = ("isolation", "reference", "antenna_r", "antenna_l")[capture.pop("rf_switch")]
-            if radio:
-                self.pool.configure(**radio)
-            if capture:
-                self.receiver.apply_config(capture)
+            if self._config_operation is not None:
+                self._config_operation(config)
+            else:
+                capture = dict(config)
+                radio = {}
+                for source, target in (("rf_freq_hz", "frequency_hz"), ("rx_gain", "rx_gain"), ("gain_mode", "gain_mode")):
+                    if source in capture:
+                        radio[target] = capture.pop(source)
+                if isinstance(radio.get("gain_mode"), int):
+                    radio["gain_mode"] = ("auto", "manual", "expert")[radio["gain_mode"]]
+                if "adc_decimation" in capture:
+                    radio["sample_rate_hz"] = DECIM_TO_FS[capture.pop("adc_decimation")]
+                if "rf_switch" in capture:
+                    radio["output"] = ("isolation", "reference", "antenna_r", "antenna_l")[capture.pop("rf_switch")]
+                if radio:
+                    self.pool.configure(**radio)
+                if capture:
+                    self.receiver.apply_config(capture)
             self._check_calibration_config(config)
             self._correction_cache.clear()
             self.configChanged.emit(config)
@@ -173,14 +184,18 @@ class IQController(PyQt6.QtCore.QObject):
             succeeded = False
             try:
                 with self._reference_io_lock:
-                    self.pool.calibrate()
+                    if self._sync_operation is None:
+                        self.pool.calibrate()
+                    else:
+                        self._sync_operation()
                     succeeded = True
             except Exception as e:
-                self.logger.error(f"sync/calibration failed: {e}")
+                self.logger.exception("sync/calibration failed")
             finally:
                 self._end_reference(succeeded)
 
-        threading.Thread(target=run, daemon=True).start()
+        self._reference_thread = threading.Thread(target=run, daemon=True, name="iq-calibration")
+        self._reference_thread.start()
 
     @PyQt6.QtCore.pyqtSlot(bool)
     def set_apply_calibration(self, enable):
@@ -192,6 +207,12 @@ class IQController(PyQt6.QtCore.QObject):
         """Per-fftshifted-bin correction for (board, firmware antenna id) at
         FFT size n, from the pool's stored calibration; None if not
         calibrated."""
+        if self._sync_needed:
+            return None
+        model = self.receiver.calibration
+        if model is not getattr(self, "_correction_model", None):
+            self._correction_cache.clear()
+            self._correction_model = model
         corrections = self._correction_cache.get(n)
         if corrections is None:
             corrections = self.receiver.cal_correction(n)
@@ -304,12 +325,16 @@ class ESPARGOSIQApplication(ESPARGOSApplication):
         self.pool.start_processing()
         return True
 
-    def create_iq_controller(self) -> IQController:
+    def create_iq_controller(self, sync_operation=None, config_operation=None) -> IQController:
         """Create the QML adapter for this application's pool."""
-        return IQController(self.pool, logger=self.logger, parent=self)
+        return IQController(self.pool, logger=self.logger, parent=self, sync_operation=sync_operation, config_operation=config_operation)
 
     def onAboutToQuit(self):
         if hasattr(self, "pool"):
+            controller = getattr(self, "iqcontrol", None)
+            worker = getattr(controller, "_reference_thread", None)
+            if worker is not None:
+                worker.join()
             # No callback may outlive the Qt objects it updates. The common
             # application teardown stops the transport, but IQ applications
             # also own a separate cluster-processing worker.

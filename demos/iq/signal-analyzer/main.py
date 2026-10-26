@@ -371,8 +371,10 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
         positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
         sets = []
         for arrived, cluster in clusters:
+            if not np.any(cluster.completion[board]):
+                continue
             if isinstance(cluster, IQAccumCluster):
-                epoch = ("accum", tuple(cluster.config_generation[board].flat))
+                epoch = ("accum", tuple(np.unique(cluster.config_generation[board][cluster.completion[board]])))
             else:
                 present = cluster.completion
                 epoch = ("raw", int(cluster.sync_info[present][0]) & 0xFFFF, int(cluster.sample_rate_hz[present][0]), bool(cluster.flags[present][0] & 256))
@@ -391,7 +393,7 @@ class EspargosSignalAnalyzer(ESPARGOSIQApplication):
                 for lane in range(cluster.vector_chunks):
                     per = {antid: sections[board, row, col, lane] for antid, (row, col) in enumerate(positions) if completion[board, row, col, lane]}
                     if per:
-                        sets.append((cluster.source_chunk_start + lane, per))
+                        sets.append((cluster.chunk_index + lane, per))
             else:
                 completion = cluster.completion
                 iq = cluster.iq

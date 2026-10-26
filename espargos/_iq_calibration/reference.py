@@ -19,6 +19,10 @@ REFERENCE_THRESHOLD = 48
 REFERENCE_BACKOFF = 0
 
 
+class ReferenceOnsetError(RuntimeError):
+    """A threshold crossing did not capture the common broadband reference."""
+
+
 def _map(function, values):
     """Independent controller operations, joined before returning or raising."""
     values = list(values)
@@ -59,7 +63,7 @@ def relative_lag(samples, reference, expected_lag=None):
         ties = np.flatnonzero(score >= score[best] - 1e-5)
         best = ties[np.argmin(np.abs(lags[ties] - expected_lag))]
     if score[best] < 0.65:
-        raise RuntimeError(f"reference snapshots do not overlap coherently (correlation {score[best]:.3f})")
+        raise ReferenceOnsetError(f"reference snapshots do not overlap coherently (correlation {score[best]:.3f})")
     return int(lags[best]), float(score[best])
 
 
@@ -134,7 +138,7 @@ def _reference_session(pool, center_hz=None, rx_gain=None, scope=None):
                 _rpc(pool.boards[bi], "set_iq_tx", {"muted": was_muted})
 
 
-def acquire_grid(pool, center, timeout=3.0, scope=None):
+def acquire_grid(pool, center, timeout=3.0, scope=None, *, threshold=REFERENCE_THRESHOLD):
     """Capture one common RF onset without prior synchronization or Wi-Fi."""
     from .scope import CalibrationScope
 
@@ -180,7 +184,7 @@ def acquire_grid(pool, center, timeout=3.0, scope=None):
             subscriptions.append((board, board.subscribe_sensor_messages(IQ_CHUNK_TYPE_HEADER, lambda m, bi=bi: receive(bi, m))))
         pool.master_board.iq.set_reference("iq", center, REFERENCE_BACKOFF)
         pool.master_board.control.command("gate_iq_reference", {"open": False})
-        scope.apply_rx({"adc_decimation": 1, "trigger": {"mode": "reference", "threshold": REFERENCE_THRESHOLD}})
+        scope.apply_rx({"adc_decimation": 1, "trigger": {"mode": "reference", "threshold": threshold}})
         generations = dict(enumerate(_map(lambda b: b.iq.get_config()["config_generation"], pool.boards)))
         wait(lambda: all(ready.get((bi, a)) == generations[bi] for bi, a in scope.pairs), "quiet REF readiness")
         pool.master_board.control.command("gate_iq_reference", {"open": True})
@@ -267,6 +271,49 @@ def collect(pool, count=16, timeout=3.0, seqs=None, mask=None):
             else:
                 pool._run(timeout=min(0.05, remaining))
         return clusters[:count]
+    finally:
+        pool.remove_callback(handle)
+
+
+def collect_origins(pool, mask, timeout=3.0):
+    """Read current RX epochs and grid origins without requiring overlap.
+
+    Restored capture schedules may select disjoint grid indices on different
+    boards. Timing metadata needs one current chunk per receiver, rather than
+    one common snapshot containing every receiver.
+    """
+    shape = (len(pool.boards), 2, 4)
+    selected = np.asarray(mask, dtype=bool)
+    if selected.shape != shape or not selected.any():
+        raise ValueError("Select at least one receiver in the pool")
+    generations = np.array(_map(lambda b: b.iq.get_config()["config_generation"], pool.boards))[:, None, None]
+    epochs = np.zeros(shape, dtype=np.uint64)
+    origins = np.zeros(shape, dtype=np.int64)
+    seen = np.zeros(shape, dtype=bool)
+    event = threading.Event()
+
+    def receive(cluster):
+        if event.is_set():
+            return
+        valid = selected & cluster.completion & (cluster.config_generation == generations) & ((cluster.sync_info & (1 << 16)) != 0)
+        epochs[valid] = cluster.fire_time_ns[valid]
+        origins[valid] = cluster.grid_origin_ns[valid]
+        seen[valid] = True
+        if np.all(seen[selected]):
+            event.set()
+
+    handle = pool.add_callback(receive, callback_predicate=lambda c: bool(np.any(c.completion[selected])))
+    try:
+        deadline = time.monotonic() + timeout
+        while not event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"Only {np.count_nonzero(seen & selected)}/{selected.sum()} receivers supplied current capture timing")
+            if pool.processing:
+                event.wait(remaining)
+            else:
+                pool._run(timeout=min(0.05, remaining))
+        return epochs, origins
     finally:
         pool.remove_callback(handle)
 

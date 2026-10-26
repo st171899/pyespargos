@@ -5,8 +5,8 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import "../../../../demos/common" as Common
-import "../../../../demos/camera" as Camera
-import "../common" as IQ
+import "../../../../demos/wifi/camera" as Camera
+import "../../../../demos/iq/common" as IQ
 
 Common.ESPARGOSApplication {
 	id: window

@@ -1,5 +1,32 @@
 # espargos-iqsampling
 
+## Integration with current pyespargos
+
+These preserved demos live in `adjusted_demos/iqsampling` in this branch.
+Their entry points now use the native `espargos.Pool` / `pool.iq` and shared
+components in `demos/iq/common`; importing `espargos_iqsampling` no longer
+replaces the native board capability. Decoder and spatial-processing helpers
+remain local. The old standalone receiver implementation files are retained
+as historical source, but are not used by these entry points.
+
+From the repository root, for example:
+
+```sh
+python adjusted_demos/iqsampling/demos/signal-analyzer/signal-analyzer.py BOARD_HOST
+python adjusted_demos/iqsampling/demos/packet-decoder/packet-decoder.py BOARD_HOST
+python adjusted_demos/iqsampling/demos/camera/camera.py -s BOARD_HOST
+```
+
+Use the host option shown by `--help` for the selected entry point. The camera
+option `--no-auto-calibration` now skips the combined broadband synchronization
+and calibration; press Sync + Calibration when ready. Packet decoding uses the
+current named Signal trigger fields, with broadband calibration before capture.
+
+The installation notes below describe the original standalone addon layout.
+For the maintained pulse radar demos, see
+[`demos/custom/pulse-radar-analyzer`](../../demos/custom/pulse-radar-analyzer/README.md).
+
+
 IQ sampling addon for pyespargos: raw synchronized IQ samples from all sensors
 (instead of CSI), with timestamp-anchored array-wide time sync, reference-tone
 fine calibration, a live multi-channel signal analyzer, and an IQ camera demo

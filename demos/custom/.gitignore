@@ -1,3 +1,6 @@
-*
-!.gitignore
-!README.md
+# Keep unrelated experiments local; include the maintained radar and its helpers.
+/*
+!/.gitignore
+!/README.md
+!/common/
+!/pulse-radar-analyzer/

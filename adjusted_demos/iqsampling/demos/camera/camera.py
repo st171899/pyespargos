@@ -19,11 +19,14 @@ sys.path.append(str(pathlib.Path(__file__).absolute().parents[4]))
 import numpy as np
 import PyQt6.QtCore
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
 import espargos  # noqa: F401 -- discovers the IQ addon
-from demos.common import CameraView, CombinedArrayMixin
+from demos.common.application import CombinedArrayMixin
+from demos.wifi.camera.camera_view import CameraView
 from espargos_iqsampling import CHUNK_SAMPLES, DECIM_TO_FS
 from espargos_iqsampling.iq_application import ESPARGOSIQApplication
-from espargos_iqsampling.iq_pool import iq_receiver_config
+from espargos.iq_receiver import iq_receiver_config
 from espargos_iqsampling.spatial import ExponentialArraySpectrum, music_beamspace_power, rectangular_fft_beamspace_power, select_frequency_bins
 from espargos_iqsampling.waterfall import WaterfallImageProvider, combined_power_dbfs, power_db_row
 
@@ -71,7 +74,7 @@ class EspargosIQCamera(CombinedArrayMixin, ESPARGOSIQApplication):
     def _add_argparse_arguments(self, parser):
         super()._add_argparse_arguments(parser)
         parser.add_argument("--no-camera", action="store_true", help="Show the spatial overlay on black instead of opening a video camera")
-        parser.add_argument("--no-auto-calibration", action="store_true", help="Start without the reference-tone calibration sweep")
+        parser.add_argument("--no-auto-calibration", action="store_true", help="Start without broadband synchronization/calibration")
 
     def __init__(self, argv):
         parser = argparse.ArgumentParser(description="ESPARGOS IQ camera", add_help=False)
@@ -146,7 +149,7 @@ class EspargosIQCamera(CombinedArrayMixin, ESPARGOSIQApplication):
         for lane in range(cluster.vector_chunks):
             start = lane * CHUNK_SAMPLES
             self._store_iq_chunk(
-                cluster.source_chunk_start + lane,
+                cluster.chunk_index + lane,
                 iq[..., start : start + CHUNK_SAMPLES],
             )
 
@@ -174,17 +177,17 @@ class EspargosIQCamera(CombinedArrayMixin, ESPARGOSIQApplication):
             return block
 
     def _capture_parameters(self):
-        config = self.pool.get_config()
+        config = self.receiver.get_config()
         sample_rate = DECIM_TO_FS.get(int(config.get("adc_decimation", 1)), DECIM_TO_FS[1])
         center_hz = float(iq_receiver_config(config).get("rf_freq_hz", 2437e6))
         return center_hz, sample_rate
 
     def _calibration_correction(self, center_hz, sample_rate):
-        correction = self.pool.cal_correction(self.fft_size)
+        correction = self.receiver.cal_correction(self.fft_size)
         if correction is None:
             return None
-        calibrated_center = self.pool.calibration_center_frequency
-        calibrated_rate = self.pool.calibration_sample_rate
+        calibrated_center = self.receiver.calibration_center_frequency
+        calibrated_rate = self.receiver.calibration_sample_rate
         if calibrated_center != center_hz or calibrated_rate != sample_rate:
             return None
         return self._build_combined_array_data(correction)
@@ -315,45 +318,26 @@ class EspargosIQCamera(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _on_calibration_changed(self):
         self._reset_processing_state()
-        self.overlay.set_capture_status("Calibrated" if self.pool.calibration is not None else "Uncalibrated — press Calibrate")
+        self.overlay.set_capture_status("Calibrated" if self.receiver.calibration is not None else "Uncalibrated — press Calibrate")
 
     def _start_iq_camera(self):
-        self.iqcontrol = self.create_iq_controller(
-            **self._combined_array_calibration_args,
-        )
+        self.iqcontrol = self.create_iq_controller()
         self.iqcontrol.set_apply_calibration(True)
         self.iqcontrol.calibrationChanged.connect(self._on_calibration_changed)
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
-        self.pool.add_iq_callback(self._on_iq_cluster)
-        self.pool.add_accumulation_callback(
+        self.receiver.add_callback(self._on_iq_cluster)
+        self.receiver.add_accumulation_callback(
             self._on_accum_cluster,
             callback_predicate=lambda cluster: cluster.is_complete,
         )
 
         def enter_and_calibrate():
             try:
-                self.overlay.set_capture_status("Synchronizing")
-                for attempt in range(2):
-                    try:
-                        self.pool.sync()
-                        break
-                    except RuntimeError:
-                        if attempt:
-                            raise
-                        self.logger.warning("IQ camera sync attempt failed; retrying once")
-                        time.sleep(1.0)
-                config = self.pool.get_config()
-                config["mode"] = "iq"
-                self.pool.apply_config(config)
                 if not self.args.no_auto_calibration:
-                    self.overlay.set_capture_status("Calibrating")
-                    center_hz, _sample_rate = self._capture_parameters()
-                    self.pool.calibrate(
-                        center_hz=center_hz,
-                        **self._combined_array_calibration_args,
-                    )
+                    self.overlay.set_capture_status("Synchronizing and calibrating")
+                    self.pool.calibrate()
                 self._reset_processing_state()
-                self.overlay.set_capture_status("Calibrated" if self.pool.calibration is not None else "Uncalibrated — press Calibrate")
+                self.overlay.set_capture_status("Calibrated" if self.receiver.calibration is not None else "Uncalibrated — press Calibrate")
                 self.logger.info("IQ camera is receiving synchronized blocks")
             except Exception as error:
                 self.overlay.set_capture_status("Startup failed")

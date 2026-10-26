@@ -3,9 +3,9 @@
 import pathlib
 import sys
 
-sys.path.append(str(pathlib.Path(__file__).absolute().parents[2]))
+sys.path.append(str(pathlib.Path(__file__).absolute().parents[4]))
 
-from demos.common import ESPARGOSCSIApplication, CSIBacklogMixin, SingleCSIFormatMixin
+from demos.wifi.common.application import ESPARGOSCSIApplication, CSIBacklogMixin, SingleCSIFormatMixin
 
 import numpy as np
 import espargos

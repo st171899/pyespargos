@@ -101,17 +101,38 @@ Common.ESPARGOSApplication {
 			}
 
 
-			Label { text: "Remove line of sight"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+			Label { text: "Clutter removal"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			Switch {
 				id: removeLosSwitch
+                objectName: "clutterRemovalSwitch"
 				property string configKey: "remove_los"
 				property string configProp: "checked"
 				Component.onCompleted: appDrawer.configManager.register(this)
 				onCheckedChanged: appDrawer.configManager.onControlChanged(this)
 				checked: false
 				ToolTip.visible: hovered
-				ToolTip.text: "Capture/subtract the static raw-IQ environment in Ping, Angle, and Radar modes. Recalibrate if the scene, TX position, gain, or receiver settings change."
+				ToolTip.text: "Subtract static background in Ping, Angle, and Radar modes. Manual: capture it with the button. Automatic: continuously learn recent acquisitions to emphasize moving targets."
 			}
+
+            Label { text: "Clutter mode"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+            ComboBox {
+                id: clutterModeSelector
+                objectName: "clutterModeSelector"
+                property string configKey: "clutter_mode"
+                property string configProp: "currentValue"
+                Component.onCompleted: appDrawer.configManager.register(this)
+                onCurrentValueChanged: appDrawer.configManager.onControlChanged(this)
+                implicitWidth: 180
+                textRole: "text"
+                valueRole: "value"
+                model: [
+                    {value: "manual", text: "Manual (200 chunks)"},
+                    {value: "automatic", text: "Automatic (rolling)"}
+                ]
+                currentValue: "manual"
+                ToolTip.visible: hovered
+                ToolTip.text: "Automatic subtracts the previous 16 raw-IQ chunks, retaining at most 0.4 seconds of history. Stationary targets fade; slow motion may also be attenuated."
+            }
 
 			// Empty label slot to align the action button onto the right side column layout
 			Item {
@@ -120,17 +141,19 @@ Common.ESPARGOSApplication {
 			}
 			Button {
 				text: "Calibrate Clutter"
+                objectName: "calibrateClutterButton"
+                enabled: backend.clutterMode === "manual"
 				Layout.preferredWidth: 180
 				onClicked: backend.calibrateClutter()
 				ToolTip.visible: hovered
-				ToolTip.text: "With the scene clear of moving targets and receiver settings fixed, average 200 synchronized 256-sample received-IQ chunks. Pluto TX is not required."
+				ToolTip.text: "With the scene clear of moving targets and receiver settings fixed, average 200 synchronized 256-sample IQ chunks. The background stays fixed until the next manual capture."
 			}
 
 			Label {
 				Layout.columnSpan: 2
 				Layout.fillWidth: true
 				text: backend.clutterStatusText
-				color: backend.clutterStatusText === "Clutter removal active" ? "#9fd18b" : (backend.clutterStatusText === "Calibrating clutter..." ? "#f2c14e" : "#9aa4b2")
+				color: (backend.clutterStatusText === "Clutter removal active" || (backend.clutterMode === "automatic" && removeLosSwitch.checked)) ? "#9fd18b" : (backend.clutterStatusText === "Calibrating clutter..." ? "#f2c14e" : "#9aa4b2")
 				font.pixelSize: 12
 				font.bold: true
 				font.family: "monospace"
@@ -171,32 +194,6 @@ Common.ESPARGOSApplication {
 				editable: true
 				ToolTip.visible: hovered
 				ToolTip.text: "The upper cutoff slice index for the 2D Radar Map. This sample defines the outer perimeter edge of the disk."
-			}
-
-			Label { text: "Radar Power Min [dB]"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMinDbControl
-				property string configKey: "radar_min_db"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: -120
-				to: radarMaxDbControl.value - 1
-				value: -50
-				editable: true
-			}
-
-			Label { text: "Radar Power Max [dB]"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMaxDbControl
-				property string configKey: "radar_max_db"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: radarMinDbControl.value + 1
-				to: 20
-				value: 0
-				editable: true
 			}
 
 
@@ -282,38 +279,33 @@ Common.ESPARGOSApplication {
 		}
 	}
 
+	TabBar {
+		id: boardTabs
+		objectName: "receiveBoardTabs"
+		currentIndex: backend.activeBoard
+		visible: backend.boardCount > 1
+		anchors.top: parent.top
+		anchors.left: parent.left
+		anchors.right: parent.right
+		anchors.margins: 10
+		z: 20
+		onCurrentIndexChanged: backend.set_active_board(currentIndex)
+		Repeater {
+			model: backend.boardCount
+			TabButton {
+				required property int index
+				text: "Receive board " + (index + 1) + "  ·  " + backend.boardHosts[index]
+			}
+		}
+	}
+
 	/** 2x4 antenna displays, front view; one tab per board on multi-board
 	    coherent arrays (only the active board is rendered) **/
 	ColumnLayout {
 		anchors.fill: parent
 		anchors.margins: 10
+		anchors.topMargin: boardTabs.visible ? boardTabs.height + 20 : 10
 		spacing: 8
-
-		TabBar {
-			id: boardTabs
-			visible: backend.boardCount > 1
-			Layout.fillWidth: true
-			z: 20
-			onCurrentIndexChanged: backend.set_active_board(currentIndex)
-			Repeater {
-				model: backend.boardCount
-				TabButton {
-					required property int index
-					text: "Array " + (index + 1) + "  ·  " + backend.boardHosts[index]
-				}
-			}
-		}
-		StackLayout {
-			Layout.fillWidth: true
-			Layout.fillHeight: true
-			currentIndex: backend.radarMode ? 2 : (backend.angleMode ? 1 : 0)
-
-
-			// SCREEN 1: Multi-Antenna Waterfall/Chart Grid View
-			ColumnLayout {
-				anchors.fill: parent
-				spacing: 8
-				visible: !backend.angleMode && !backend.radarMode
 
 		Repeater {
 			model: window.frontViewRows.length
@@ -639,10 +631,12 @@ Common.ESPARGOSApplication {
 			}
 		}
 	}
-		
+
 	Loader {
 		anchors.fill: parent
+		anchors.topMargin: boardTabs.visible ? boardTabs.height + 20 : 0
 		active: backend.angleMode
+		z: 10
 		sourceComponent: Component {
 			Rectangle {
 				color: "#101014"
@@ -758,8 +752,11 @@ Common.ESPARGOSApplication {
 
 		Loader {
 		id: radarModeLoader
+		objectName: "radarModeLoader"
 		anchors.fill: parent
+		anchors.topMargin: boardTabs.visible ? boardTabs.height + 20 : 0
 		active: backend.radarMode
+		z: 11
 
 		sourceComponent: Component {
 			Rectangle {
@@ -801,6 +798,8 @@ Common.ESPARGOSApplication {
 
 							function createImageData() {
 								if (!available || width <= 0 || height <= 0) return;
+                                // A deferred resize must not overwrite a newer received frame.
+                                if (imageData && imageData.width === width && imageData.height === height) return;
 								const ctx = plotCanvas.getContext("2d");
 								if (ctx) {
 									imageData = ctx.createImageData(width, height);
@@ -868,7 +867,7 @@ Common.ESPARGOSApplication {
 							anchors.fill: parent
 							z: 10
 
-							property real plotRadius: Math.max(0, Math.min((width - 180) / 2, height - 40))
+							property real plotRadius: Math.max(0, Math.min(width / 2, height - 40))
 							property var origin_x: 0.5 * gridOverlayCanvas.width
 							property var origin_y: gridOverlayCanvas.height // Match bottom edge baseline exactly
 							property var phi_num: 6
@@ -965,78 +964,6 @@ Common.ESPARGOSApplication {
 							onHeightChanged: gridOverlayCanvas.requestPaint()
 						}
 
-						ColumnLayout {
-							id: radarColorbar
-							anchors.right: parent.right
-							anchors.rightMargin: 18
-							anchors.verticalCenter: parent.verticalCenter
-							width: 72
-							height: Math.max(1, Math.min(parent.height - 24, gridOverlayCanvas.plotRadius * 1.15))
-							spacing: 6
-							z: 11
-
-							Label {
-								Layout.alignment: Qt.AlignHCenter
-								text: "Received power\n(dBFS)"
-								color: "#d7dde5"
-								font.pixelSize: 10
-								horizontalAlignment: Text.AlignHCenter
-								wrapMode: Text.Wrap
-							}
-
-							Item {
-								Layout.fillWidth: true
-								Layout.fillHeight: true
-
-								Rectangle {
-									id: radarColorbarGradient
-									width: 18
-									anchors.top: parent.top
-									anchors.bottom: parent.bottom
-									anchors.horizontalCenter: parent.horizontalCenter
-									border.color: "#aab4be"
-									border.width: 1
-									gradient: Gradient {
-										GradientStop { position: 0.0; color: "#fde725" }
-										GradientStop { position: 0.25; color: "#5ec962" }
-										GradientStop { position: 0.5; color: "#21918c" }
-										GradientStop { position: 0.75; color: "#3b528b" }
-										GradientStop { position: 1.0; color: "#440154" }
-									}
-								}
-
-								Label {
-									anchors.top: parent.top
-									anchors.left: radarColorbarGradient.right
-									anchors.leftMargin: 5
-									text: backend.radarMaxDb.toFixed(0)
-									color: "#ffffff"
-									font.pixelSize: 10
-								}
-								Label {
-									anchors.bottom: parent.bottom
-									anchors.left: radarColorbarGradient.right
-									anchors.leftMargin: 5
-									text: backend.radarMinDb.toFixed(0)
-									color: "#ffffff"
-									font.pixelSize: 10
-								}
-
-								Repeater {
-									model: 3
-									Label {
-										required property int index
-										anchors.left: radarColorbarGradient.right
-										anchors.leftMargin: 5
-										y: parent.height * (index + 1) / 4 - height / 2
-										text: (backend.radarMaxDb - (index + 1) * (backend.radarMaxDb - backend.radarMinDb) / 4).toFixed(0)
-										color: "#ffffff"
-										font.pixelSize: 10
-									}
-								}
-							}
-						}
-
 					}
 
 					// Dynamic Processing Status Label
@@ -1097,8 +1024,6 @@ Common.ESPARGOSApplication {
 		}
 	}
 
-	}
-}
+
 
 }
-	

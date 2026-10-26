@@ -5,7 +5,7 @@ from __future__ import annotations
 import PyQt6.QtCore
 import PyQt6.QtMultimedia
 
-import video_camera
+from demos.wifi.camera import video_camera
 
 
 class CameraView(PyQt6.QtCore.QObject):

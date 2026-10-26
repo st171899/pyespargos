@@ -20,6 +20,22 @@ from ..sensor_calibration import compute_reference_path_delays
 from .reference import _map
 
 
+def _adjust_monitor_gain(monitor, board, timeout):
+    """Keep pilots above monitor quantization noise and below ADC clipping."""
+    for _ in range(6):
+        frames = monitor.collect(2, timeout)
+        peak = max(max(abs(z.real).max(), abs(z.imag).max()) for z in frames)
+        config = _rpc(board, "get_iq_monitor")
+        gain = config["gain"]
+        if 120 <= peak <= 400:
+            return
+        delta = int(np.clip(round(20 * np.log10(240 / max(peak, 1))), -12, 12))
+        adjusted = max(0, min(config["gain_max"], gain + delta))
+        if adjusted == gain:
+            return
+        _rpc(board, "set_iq_monitor", {"gain": adjusted})
+
+
 def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=None, timeout=10.0, scope=None):
     """Synchronize RX, measure TX through REF, and restore user waveforms.
 
@@ -150,20 +166,7 @@ def calibrate(pool, *, rx_gain=None, cable_lengths=None, cable_velocity_factors=
             for bi in active:
                 _rpc(boards[bi], "set_iq_tx", {"muted": False, "transmitters": [{"antid": a, "amplitude": int((bi, a) in emitting)} for a in targets[bi]]})
                 status.wait(boards[bi], lambda s, bi=bi: all(abs(s["sensors"][a]["applied_amplitude"] - int((bi, a) in emitting)) < 1e-6 for a in targets[bi]), timeout)
-            # Dense pilots need enough ADC resolution per tone. Set gain from
-            # the received peak, leaving headroom when several TXs add together.
-            monitor_config = _rpc(pool.master_board, "get_iq_monitor")
-            gain = monitor_config["gain"]
-            for _ in range(6):
-                captures = monitor.collect(3, timeout)
-                peak = float(np.median([max(abs(z.real).max(), abs(z.imag).max()) for z in captures]))
-                if 64 <= peak <= 400:
-                    break
-                adjusted = int(np.clip(gain + (6 if peak < 64 else -6), 0, monitor_config["gain_max"]))
-                if adjusted == gain:
-                    break
-                gain = adjusted
-                _rpc(pool.master_board, "set_iq_monitor", {"gain": gain})
+            _adjust_monitor_gain(monitor, pool.master_board, timeout)
             index = next(j for j, (bi, a, _) in enumerate(group) if (bi, a) == reference)
             delays = np.array([path((bi, a)) for bi, a, _ in group])
             delays -= delays[index]

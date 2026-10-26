@@ -521,7 +521,7 @@ class IQReceiver(ClusterAssembler):
         if isinstance(sensor_message.payload, IQAccumPacket):
             payload = sensor_message.payload
             return (
-                int(payload.source_chunk_start),
+                self._unwrap_chunk_index(payload.source_chunk_start),
                 int(payload.source_chunk_end),
                 int(payload.vector_chunks),
                 int(payload.sample_rate_hz),
@@ -535,7 +535,15 @@ class IQReceiver(ClusterAssembler):
             # all eight source epochs to agree before it publishes the event;
             # this synthetic, contiguous key is association-only.
             return (1 << 128) | (int(board_index) << 96) | (int(payload.config_generation) << 64) | (int(payload.capture_id) << 32) | int(payload.capture_chunk_offset)
-        raw = int(payload.source_chunk_index) & 0x00FFFFFF
+        return self._unwrap_chunk_index(payload.source_chunk_index)
+
+    def _unwrap_chunk_index(self, source_index):
+        """Track the common 24-bit sample counter for raw and averaged IQ.
+
+        Accumulation window starts can include an unmasked sync-grid offset.
+        Their underlying source counter still wraps every 2**24 chunks.
+        """
+        raw = int(source_index) & 0x00FFFFFF
         with self._unwrap_lock:
             # Different sensors can straddle a wrap in arrival order. Keep
             # the newest index as the reference; a delayed pre-wrap packet
@@ -559,11 +567,13 @@ class IQReceiver(ClusterAssembler):
 
     def _create_cluster(self, cache_name, cluster_key, board_index, first_message) -> IQCluster:
         if cache_name == _CACHE_ACCUMULATIONS:
-            return IQAccumCluster(
+            cluster = IQAccumCluster(
                 first_message.payload,
                 self.board_revisions,
                 gain_phase_compensation=self._gain_phase_enabled,
             )
+            cluster.chunk_index = cluster_key[0]
+            return cluster
         return IQCluster(
             cluster_key[-1] if cache_name == _CACHE_CHUNKS else cluster_key,
             self.board_revisions,
@@ -763,7 +773,16 @@ class IQReceiver(ClusterAssembler):
         A restarted sample engine has a new epoch. Same-frequency IQ mode
         switches through the pool transfer the correction to that epoch.
         Unhandled restarts and retunes remain detectable as a mismatch."""
-        return self._calibration is not None and self._calibration_epoch == np.asarray(source.fire_time_ns, dtype=np.uint64).tobytes()
+        if self._calibration is None or self._calibration_epoch is None:
+            return False
+        epochs = np.asarray(source.fire_time_ns, dtype=np.uint64)
+        expected = np.frombuffer(self._calibration_epoch, np.uint64).reshape(epochs.shape)
+        present = np.asarray(getattr(source, "completion", np.ones(epochs.shape, bool)), dtype=bool)
+        selected = present & (expected != 0)
+        # TX positions and missing RX channels carry zero metadata. They must
+        # not invalidate a calibrated partial cluster; present uncalibrated RX
+        # epochs, however, must never be silently accepted.
+        return bool(np.any(selected) and not np.any(present & (expected == 0)) and np.all(epochs[selected] == expected[selected]))
 
     def cal_correction(self, fft_size=CHUNK_SAMPLES):
         """Per-bin correction vectors synthesized from the stored calibration
@@ -819,6 +838,7 @@ class IQReceiver(ClusterAssembler):
         ref = bi * 8 + row * 4 + col
         with iq_reference.reference_session(self, center_hz, rx_gain, scope) as (center, fs):
             self._calibration = None
+            onset_threshold = iq_reference.REFERENCE_THRESHOLD
             for attempt in range(attempts):
                 try:
                     if reuse_grid:
@@ -826,7 +846,7 @@ class IQReceiver(ClusterAssembler):
                         scope.apply_rx({"trigger": {"mode": "interval", "interval_chunks": 8192, "burst_chunks": 4}})
                         seqs = None
                     else:
-                        seqs = iq_reference.acquire_grid(self, center, timeout, scope)
+                        seqs = iq_reference.acquire_grid(self, center, timeout, scope, threshold=onset_threshold)
                     training = iq_reference.collect(self, count=32, timeout=iq_ready_timeout, seqs=seqs, mask=scope.mask)
                     tau, phi, quality = iq_reference.fit(training, ref, scope.mask)
                     validation = iq_reference.collect(self, count=32, timeout=iq_ready_timeout, seqs=seqs, mask=scope.mask)
@@ -841,6 +861,12 @@ class IQReceiver(ClusterAssembler):
                     if attempt + 1 == attempts:
                         raise IQCalibrationError(str(error)) from error
                     self._logger.info("Acquiring a fresh broadband grid: %s", error)
+                    if isinstance(error, iq_reference.ReferenceOnsetError):
+                        # A narrowband interferer can cross the quiet-to-REF
+                        # threshold before the gated broadband source arrives.
+                        # Re-arm at a higher edge threshold, keeping the same
+                        # correlation and independent validation requirements.
+                        onset_threshold = min(192, onset_threshold * 2)
             timing = tau / 80e6
             epoch = np.where(scope.mask, training[0].fire_time_ns, 0).astype(np.uint64).tobytes()
             grid_origin = training[0].grid_origin_ns.copy()

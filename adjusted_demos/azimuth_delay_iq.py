@@ -18,12 +18,11 @@ from matplotlib import colormaps
 
 repository_root = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repository_root))
-sys.path.insert(0, str(repository_root / "addons" / "iqsampling"))
+sys.path.insert(0, str(repository_root / "adjusted_demos" / "iqsampling"))
 
 from espargos_iqsampling import CHUNK_SAMPLES, DECIM_TO_FS, IQAccumCluster, SENSOR_COUNT
 from espargos_iqsampling.iq_application import ESPARGOSIQApplication
 from espargos.array_processing import music_spectrum
-
 
 BEAMSPACE_OVERSAMPLING = 16
 TX_SAMPLE_RATE_HZ = 40e6
@@ -144,7 +143,10 @@ class AzimuthDelayIQApp(ESPARGOSIQApplication):
             self.sdr.tx(np.tile(self._tx_waveform, 8))
         self.logger.info(
             "Pluto TX started: chirp_frames=%d bandwidth_hz=%.0f pings_per_256=%d gain_db=%.2f",
-            config["chirp_frames"], config["bandwidth_hz"], config["pings_per_256"], config["tx_gain_db"],
+            config["chirp_frames"],
+            config["bandwidth_hz"],
+            config["pings_per_256"],
+            config["tx_gain_db"],
         )
 
     @PyQt6.QtCore.pyqtSlot()
@@ -206,17 +208,14 @@ class AzimuthDelayIQApp(ESPARGOSIQApplication):
 
     def _refresh_rx_sample_rate(self):
         try:
-            config = self.pool.get_config()
+            config = self.receiver.get_config()
             self._rx_sample_rate_hz = DECIM_TO_FS.get(int(config.get("adc_decimation", 1)), DECIM_TO_FS[1])
         except Exception:
             pass
 
     def _publish_iq_samples(self, samples_by_antenna):
         with self._iq_lock:
-            self._latest_iq = [
-                np.asarray(samples_by_antenna.get(antenna_id, np.zeros(CHUNK_SAMPLES)), dtype=np.complex64).copy()
-                for antenna_id in range(SENSOR_COUNT)
-            ]
+            self._latest_iq = [np.asarray(samples_by_antenna.get(antenna_id, np.zeros(CHUNK_SAMPLES)), dtype=np.complex64).copy() for antenna_id in range(SENSOR_COUNT)]
             self._iq_generation += 1
 
     @PyQt6.QtCore.pyqtSlot(int, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QLineSeries)
@@ -237,10 +236,10 @@ class AzimuthDelayIQApp(ESPARGOSIQApplication):
     def update_data(self):
         with self._pending_lock:
             clusters, self._pending_clusters = self._pending_clusters, []
-        if not clusters or not self.pool.boards:
+        if not clusters or not self.receiver.boards:
             return
 
-        board = self.pool.boards[0]
+        board = self.receiver.boards[0]
         positions = [board.revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
         latest = None
         latest_index = -1
@@ -249,22 +248,14 @@ class AzimuthDelayIQApp(ESPARGOSIQApplication):
                 completion = cluster.section_completion[0]
                 sections = cluster.iq_sections[0]
                 for lane in range(cluster.vector_chunks):
-                    per = {
-                        antenna_id: sections[row, col, lane]
-                        for antenna_id, (row, col) in enumerate(positions)
-                        if completion[row, col, lane]
-                    }
-                    index = cluster.source_chunk_start + lane
+                    per = {antenna_id: sections[row, col, lane] for antenna_id, (row, col) in enumerate(positions) if completion[row, col, lane]}
+                    index = cluster.chunk_index + lane
                     if per and index >= latest_index:
                         latest, latest_index = per, index
             else:
                 completion = cluster.completion[0]
                 samples = cluster.iq[0]
-                per = {
-                    antenna_id: samples[row, col]
-                    for antenna_id, (row, col) in enumerate(positions)
-                    if completion[row, col]
-                }
+                per = {antenna_id: samples[row, col] for antenna_id, (row, col) in enumerate(positions) if completion[row, col]}
                 if per and cluster.chunk_index >= latest_index:
                     latest, latest_index = per, cluster.chunk_index
 
@@ -333,15 +324,12 @@ class AzimuthDelayIQApp(ESPARGOSIQApplication):
     def _start_iq_gui(self):
         self.iqcontrol = self.create_iq_controller()
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
-        self.pool.add_iq_callback(self._on_iq_cluster, include_partial=True)
-        self.pool.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
 
         def enter_iq_mode():
             try:
-                self.pool.sync()
-                config = self.pool.get_config()
-                config["mode"] = "iq"
-                self.pool.apply_config(config)
+                self.pool.calibrate()
             except Exception as error:
                 self.logger.error(f"could not enter IQ mode: {error}")
 

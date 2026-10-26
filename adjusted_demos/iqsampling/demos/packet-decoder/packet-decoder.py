@@ -20,6 +20,8 @@ sys.path.append(str(pathlib.Path(__file__).absolute().parents[4]))
 import PyQt6.QtCharts
 import PyQt6.QtCore
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
 import espargos  # noqa: F401 -- loads addon entry points
 from espargos_iqsampling.iq_application import ESPARGOSIQApplication
 from espargos_iqsampling.packet_decoding import default_pipeline
@@ -238,7 +240,7 @@ class PacketDecoderApplication(ESPARGOSIQApplication):
 
     def _calibrate_pool(self, calibrate, additional_calibrate_args):
         super()._calibrate_pool(calibrate=calibrate, additional_calibrate_args=additional_calibrate_args)
-        self._signal_callback = self.pool.add_signal_capture_callback(self._on_capture)
+        self._signal_callback = self.receiver.add_signal_capture_callback(self._on_capture)
         self._decode_threads = [
             threading.Thread(
                 target=self._decode_loop,
@@ -252,44 +254,22 @@ class PacketDecoderApplication(ESPARGOSIQApplication):
         try:
             center_hz = self.args.center_hz or _wifi_channel_center_hz(self.args.channel)
             self._set_status("Establishing array timestamp grid")
-            self.pool.apply_config(
+            self.pool.configure(mode="iq_rx", frequency_hz=center_hz, sample_rate_hz=float(self.args.sample_rate) * 1e6, gain_mode="manual", rx_gain=self.args.gain)
+            self.pool.calibrate()
+            self.receiver.apply_config(
                 {
-                    "mode": "wifi",
-                    "adc_decimation": DECIMATION[self.args.sample_rate],
-                    "rf_freq_hz": center_hz,
-                    # The coarse timestamp anchor only needs a packet decoded
-                    # by every hardware WiFi modem. Let their AGCs acquire it;
-                    # the lower fixed IQ gain is applied afterwards and cannot
-                    # change the resulting timestamp grid.
-                    "gain_mode": "auto",
-                    "trigger_mode": 4,
-                    "trigger_config": [
-                        self.args.threshold,
-                        self.args.trigger_mask,
-                        self.args.holdoff_ms,
-                        self.args.capture_chunks,
-                        self.args.silence_threshold,
-                    ],
+                    "trigger": {
+                        "mode": "signal",
+                        "threshold": self.args.threshold,
+                        "antennas": [a for a in range(8) if self.args.trigger_mask & (1 << a)],
+                        "holdoff_ms": self.args.holdoff_ms,
+                        "capture_chunks": self.args.capture_chunks,
+                        "quiet_threshold": self.args.silence_threshold,
+                    }
                 }
             )
-            self.pool.sync(timeout=self.args.sync_timeout)
-            self.pool.apply_config(
-                {
-                    "gain_mode": "manual",
-                    "rx_gain": self.args.gain,
-                }
-            )
-            self.pool.enter_iq_mode(timeout=self.args.sync_timeout)
-            onset = (
-                f"silence {self.args.silence_threshold}"
-                if self.args.silence_threshold
-                else "level trigger"
-            )
-            self._set_status(
-                f"Listening at {center_hz / 1e6:g} MHz · "
-                f"{self.args.sample_rate} MSa/s · threshold {self.args.threshold} · "
-                f"{onset} · {self.args.capture_chunks} chunks"
-            )
+            onset = f"silence {self.args.silence_threshold}" if self.args.silence_threshold else "level trigger"
+            self._set_status(f"Listening at {center_hz / 1e6:g} MHz · " f"{self.args.sample_rate} MSa/s · threshold {self.args.threshold} · " f"{onset} · {self.args.capture_chunks} chunks")
         except Exception as error:
             self.logger.exception("packet-decoder initialization failed")
             self._set_status(f"Error: {error}")
@@ -469,11 +449,10 @@ def main():
     interrupt_timer.timeout.connect(lambda: None)
     result = app.exec()
     app.logger.info(
-        "final packet-decoder counts: %s; protocols=%s; Signal transport=%s "
-        "(rolling complete-event rate %.2f/s)",
+        "final packet-decoder counts: %s; protocols=%s; Signal transport=%s " "(rolling complete-event rate %.2f/s)",
         app._counts,
         app._protocol_counts,
-        app.pool.signal_capture_stats,
+        app.receiver.signal_capture_stats,
         app.capture_rate,
     )
     return result

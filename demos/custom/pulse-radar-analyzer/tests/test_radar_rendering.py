@@ -2,7 +2,7 @@
 
 Run with an OpenGL-capable display (on headless Linux, use xvfb-run):
     QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
-        python demos/pulse-radar-analyzer/tests/test_radar_rendering.py
+        python demos/custom/pulse-radar-analyzer/tests/test_radar_rendering.py
 """
 
 import importlib.util

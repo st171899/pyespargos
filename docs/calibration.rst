@@ -198,6 +198,18 @@ transmission on participating boards. These settings are restored afterward.
    but starts without stored Python calibration. Creating a new grid during
    subgroup calibration is rejected because it would restart other sensors.
 
+Multi-board reciprocal TX calibration temporarily uses selected IQ RX sensors as pilot transmitters
+as well as receivers. This includes receive-only boards, whose reciprocal links
+can connect isolated same-board REF branches. The configured calibration path
+is used for all pilots. After measurement, helpers return to RX and only the
+original IQ TX sensors receive transmit corrections.
+
+After TX calibration restores the mixed sensor roles, a final REF measurement
+refits the active receivers' phase and delay. This does not change TX roles,
+frequencies, or replay origins. Receiver correction epochs are taken from fresh
+chunks after restoring the operating sample rate and trigger. TX replay epochs
+and origins must remain unchanged before the combined result is published.
+
 How to measure calibration
 --------------------------
 

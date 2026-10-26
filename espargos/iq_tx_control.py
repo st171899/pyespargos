@@ -8,6 +8,10 @@ import zlib
 from .board import EspargosHTTPStatusError
 
 
+class CalibrationMeasurementError(RuntimeError):
+    """Pilot captures did not pass the independent calibration quality check."""
+
+
 class _SensorTXError(RuntimeError):
     def __init__(self, board, antenna, code):
         self.code = code
@@ -15,17 +19,26 @@ class _SensorTXError(RuntimeError):
 
 
 def _rpc(board, path, payload=None):
-    if payload is None:
-        return board.control.get_json(path)
-    try:
-        result = board.control.post_json(path, payload)
-    except EspargosHTTPStatusError as error:
-        # These errors occur while serializing status, after set_iq_tx has
-        # applied the settings. Read status again without repeating the write.
-        if path == "set_iq_tx" and error.status == 503 and error.body in ("not enough memory for JSON response", "not enough memory for TX status"):
-            return board.control.get_json("get_iq_tx")
-        raise
-    return None if result == "ok" else json.loads(result)
+    # A busy controller can briefly lack memory to encode its JSON response.
+    # Reads and absolute settings can be repeated; scheduled waveform commands
+    # are deliberately left to _waveform's stricter retry rules.
+    retryable = payload is None or path in ("set_iq_tx", "set_iq_monitor")
+    for attempt in range(5):
+        try:
+            if payload is None:
+                return board.control.get_json(path)
+            result = board.control.post_json(path, payload)
+            return None if result == "ok" else json.loads(result)
+        except EspargosHTTPStatusError as error:
+            if path == "set_iq_tx" and error.status == 503 and error.body in ("not enough memory for JSON response", "not enough memory for TX status"):
+                # The controller has already applied this write. Retry reads only.
+                return _rpc(board, "get_iq_tx")
+            if retryable and error.status == 503 and attempt < 4:
+                time.sleep(0.1 * 2**attempt)
+                continue
+            if payload is not None:
+                error.add_note(f"{board.host}: {path} payload={json.dumps(payload, sort_keys=True)}")
+            raise
 
 
 def _wait(board, predicate, timeout):

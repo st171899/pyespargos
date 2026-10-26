@@ -6,7 +6,7 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtCharts
 import "../../../../demos/common" as Common
-import "../common" as IQ
+import "../../../../demos/iq/common" as IQ
 
 Common.ESPARGOSApplication {
     id: window

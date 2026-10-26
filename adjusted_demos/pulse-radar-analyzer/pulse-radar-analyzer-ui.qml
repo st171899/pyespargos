@@ -5,8 +5,8 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtCharts
-import "../common" as Common
-import "../common" as IQ
+import "../../demos/common" as Common
+import "../../demos/iq/common" as IQ
 
 Common.ESPARGOSApplication {
 	id: window
@@ -702,6 +702,8 @@ Common.ESPARGOSApplication {
 
 							function createImageData() {
 								if (!available || width <= 0 || height <= 0) return;
+                                // A deferred resize must not overwrite a newer received frame.
+                                if (imageData && imageData.width === width && imageData.height === height) return;
 								const ctx = plotCanvas.getContext("2d");
 								if (ctx) {
 									imageData = ctx.createImageData(width, height);

@@ -896,8 +896,12 @@ class Board(object):
                 break
 
             if timeout_total > self._stream_timeout:
-                self._logger.warning("UDP timeout, disconnecting")
-                self._stream_connected = False
+                # UDP has no connection to time out. Muted TX-only boards,
+                # sparse captures and reference readiness can be quiet for
+                # seconds; keep the subscription and keepalives alive so the
+                # next calibration's status/onset records can still arrive.
+                self._logger.debug("UDP stream idle; keeping subscription open")
+                timeout_total = 0
 
     def _stream_loop_websocket(self, path: str):
         try:
@@ -963,6 +967,11 @@ class Board(object):
                     if not 200 <= res.status < 300:
                         raise EspargosHTTPStatusError(res.status, path, body.decode("utf-8", errors="replace"))
                     return body.decode("utf-8")
+                except EspargosHTTPStatusError:
+                    # The response body has been drained. Keep this healthy
+                    # TCP connection even for a busy/low-memory response;
+                    # reconnecting on each retry consumes more controller RAM.
+                    raise
                 except BaseException as error:
                     conn.close()
                     self._http_connection = None

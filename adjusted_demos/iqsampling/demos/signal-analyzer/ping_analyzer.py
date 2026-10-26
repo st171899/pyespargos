@@ -55,12 +55,14 @@ import matplotlib.colors
 import PyQt6.QtCore
 import PyQt6.QtCharts
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
 import espargos  # noqa: F401 -- importing espargos loads the addon packages onto sys.path
-from demos.common import CombinedArrayMixin
+from demos.common.application import CombinedArrayMixin
 
 from espargos import CHUNK_SAMPLES, DECIM_TO_FS, IQAccumCluster, SENSOR_COUNT
-from demos.common.iq_application import ESPARGOSIQApplication
-from demos.common.iq_waterfall import WaterfallImageProvider, power_db_row
+from demos.iq.common.application import ESPARGOSIQApplication
+from demos.iq.common.iq_waterfall import WaterfallImageProvider, power_db_row
 
 WATERFALL_HEIGHT = 300
 ADC_FULL_SCALE = 512.0
@@ -87,30 +89,29 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     traceSampleCountChanged = PyQt6.QtCore.pyqtSignal()
     angleChanged = PyQt6.QtCore.pyqtSignal()
     txStateChanged = PyQt6.QtCore.pyqtSignal()
-    radarMapChanged = PyQt6.QtCore.pyqtSignal(list) # Add this signal for the heatmap vector
+    radarMapChanged = PyQt6.QtCore.pyqtSignal(list)  # Add this signal for the heatmap vector
     radarConfigChanged = PyQt6.QtCore.pyqtSignal()
     radarStatusChanged = PyQt6.QtCore.pyqtSignal()
 
-
     DEFAULT_CONFIG = {
-    "display_mode": "power",
-    "fft_size": 1024,
-    "complete_only": False,
-    "apply_calibration": True,
-    "chirp_frames": 16,
-    "bandwidth_hz": 40e6,
-    "pings_per_256": 2,
-    "tx_gain_db": 0,
-    "remove_los": False,
-}
+        "display_mode": "power",
+        "fft_size": 1024,
+        "complete_only": False,
+        "apply_calibration": True,
+        "chirp_frames": 16,
+        "bandwidth_hz": 40e6,
+        "pings_per_256": 2,
+        "tx_gain_db": 0,
+        "remove_los": False,
+    }
 
     # --- ping TX config ---
     PING_TX_DEFAULTS = {
-    "chirp_frames": 16,
-    "bandwidth_hz": 40e6,
-    "pings_per_256": 2,
-    "tx_gain_db": 0,
-}
+        "chirp_frames": 16,
+        "bandwidth_hz": 40e6,
+        "pings_per_256": 2,
+        "tx_gain_db": 0,
+    }
 
     def __init__(self, argv):
         parser = argparse.ArgumentParser(description="ESPARGOS Demo: live IQ signal analyzer", add_help=False)
@@ -211,15 +212,12 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         row_count = max(0, int(getattr(self, "n_rows", 0)))
         column_count = max(0, int(getattr(self, "n_cols", 0)))
         geometry = np.full((row_count, column_count), -1, dtype=int)
-        if not hasattr(self, "pool") or not self.pool.boards or not 0 <= self.active_board < len(self.pool.boards):
+        if not hasattr(self, "receiver") or not self.receiver.boards or not 0 <= self.active_board < len(self.receiver.boards):
             return geometry
         if not hasattr(self, "indexing_matrix"):
             return geometry
-        revision = self.pool.boards[self.active_board].revision
-        local_id_by_position = {
-            revision.antenna_id_to_row_col(antenna_id): antenna_id
-            for antenna_id in range(SENSOR_COUNT)
-        }
+        revision = self.receiver.boards[self.active_board].revision
+        local_id_by_position = {revision.antenna_id_to_row_col(antenna_id): antenna_id for antenna_id in range(SENSOR_COUNT)}
         for row in range(row_count):
             for column in range(column_count):
                 if row >= self.indexing_matrix.shape[0] or column >= self.indexing_matrix.shape[1]:
@@ -232,7 +230,6 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     if 0 <= antenna_id < SENSOR_COUNT:
                         geometry[row, column] = antenna_id
         return geometry
-    
 
     def _cancel_line_of_sight(self, raw_traces, common_power):
         """Independently isolates, aligns, and cancels EVERY periodic line-of-sight
@@ -247,7 +244,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         pings_per_256 = max(1, min(config["pings_per_256"], CHUNK_SAMPLES))
         burst_length = CHUNK_SAMPLES // pings_per_256
         chirp_frames = max(1, min(config["chirp_frames"], burst_length))
-        
+
         sample_trace = next(iter(raw_traces.values()))
         trace_len = sample_trace.size
         is_matched_domain = np.max(np.abs(sample_trace)) > (ADC_FULL_SCALE * 2.0)
@@ -271,7 +268,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # 3. Fold the global power profile to find the true relative arrival index
         # We wrap across the specific total_pings_in_trace window size cleanly
         global_power = np.nan_to_num(np.asarray(common_power[:trace_len], dtype=np.float64), nan=0.0)
-        folded_power = np.sum(global_power[:total_pings_in_trace * burst_length].reshape(total_pings_in_trace, burst_length), axis=0)
+        folded_power = np.sum(global_power[: total_pings_in_trace * burst_length].reshape(total_pings_in_trace, burst_length), axis=0)
         relative_coarse_peak = int(np.argmax(folded_power))
 
         canceled_traces = {}
@@ -285,14 +282,14 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             ant_power = np.abs(ant_matched) ** 2
 
             # Fold this antenna's profile to track its specific spatial micro-shift delay
-            ant_folded = np.sum(ant_power[:total_pings_in_trace * burst_length].reshape(total_pings_in_trace, burst_length), axis=0)
+            ant_folded = np.sum(ant_power[: total_pings_in_trace * burst_length].reshape(total_pings_in_trace, burst_length), axis=0)
             relative_ant_peak = int(np.argmax(ant_folded))
 
             # 5. Loop through and cancel EVERY single ping present across the entire active payload
             for p in range(total_pings_in_trace):
                 # Calculate the absolute sample index for this specific period's ping interval
                 ant_peak_idx = p * burst_length + relative_ant_peak
-                
+
                 if ant_peak_idx >= clean_trace.size:
                     continue
 
@@ -303,14 +300,14 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 start_win = max(0, end_win - raw_ref.size)
 
                 observed = clean_trace[start_win:end_win]
-                current_template = raw_ref[:observed.size]
+                current_template = raw_ref[: observed.size]
                 current_energy = np.vdot(current_template, current_template).real
 
                 # Stable Least-Squares Projection per individual pulse interval
                 if observed.size > 0 and current_energy > 1e-12:
                     coefficient = np.vdot(current_template, observed) / current_energy
                     max_allowed_gain = 5.0 if is_matched_domain else 500.0
-                    
+
                     if np.abs(coefficient) < max_allowed_gain:
                         clean_trace[start_win:end_win] -= coefficient * current_template
 
@@ -318,10 +315,9 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         return canceled_traces
 
-    
     def _publish_sample_windows(self, traces):
         """Publish coherent display windows for the GUI-thread Qt Charts."""
-        
+
         # 1. Capture a clean snapshot of the raw traces BEFORE mutating them
         raw_traces_snapshot = {antid: samples.copy() for antid, samples in traces.items()} if traces else {}
 
@@ -329,11 +325,11 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             # Coherently compress incoming chirps into sharp range profile peaks
             matched_traces = {antid: self._angle_matched_trace(trace) for antid, trace in traces.items()}
             common_length = min((t.size for t in matched_traces.values()), default=0)
-            
+
             if common_length > 0:
                 matched_traces = {antid: t[:common_length] for antid, t in matched_traces.items()}
                 common_power = np.sum([np.abs(t) ** 2 for t in matched_traces.values()], axis=0)
-                
+
                 # Route appropriate domains based on active mode context
                 if self.display_mode in ("angle", "radar"):
                     # Angle and Radar modes expect pulse-compressed matched-filter vectors
@@ -367,7 +363,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self.angleChanged.emit()
 
         # FIX: Pass the raw, unmutated trace snapshot to the map renderer to slice individual bursts
-        if self.display_mode == "radar" and raw_traces_snapshot: 
+        if self.display_mode == "radar" and raw_traces_snapshot:
             if len(raw_traces_snapshot) == SENSOR_COUNT:
                 try:
                     self._render_radar_heatmap(raw_traces_snapshot)
@@ -391,7 +387,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         burst_length = CHUNK_SAMPLES // pings_per_256
 
         corrected, calibration_ready = self._angle_corrected_traces(traces)
-        
+
         if not calibration_ready:
             self._radar_status = "⚠️ Array Uncalibrated: Click 'Run Calibration' in the receiver settings drawer."
             self.radarStatusChanged.emit()
@@ -405,7 +401,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         valid_burst_len = min(burst_length, corrected.shape[1])
         if valid_burst_len <= 0:
             return
-        
+
         sliced_traces = corrected[:, :valid_burst_len]
         geometry = self._angle_geometry()
         row_count, column_count = geometry.shape
@@ -414,7 +410,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         # Compress the chirps to lift the target energy out of the noise floor
         compressed_traces = np.array([self._angle_matched_trace(corrected[ant]) for ant in range(SENSOR_COUNT)])
-        
+
         # Crop the compressed streams down to the current active burst segment
         compressed_sliced = compressed_traces[:, :valid_burst_len]
 
@@ -428,7 +424,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         column_fft_size = 256
         spatial_window = np.hanning(column_count).astype(np.float32)[None, :, None]
-        
+
         # Execute 1D Horizontal Azimuth FFT over the physical layout rows
         spatial_fft = np.fft.fftshift(
             np.fft.fft(spatial_samples * spatial_window, n=column_fft_size, axis=1),
@@ -441,14 +437,14 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         ui_grid_size = 256
         final_power_grid = np.zeros((column_fft_size, ui_grid_size), dtype=np.float32)
         fill_delay_bins = min(valid_burst_len, ui_grid_size)
-        
-        # Populate the 256x256 grid frame correctly: 
+
+        # Populate the 256x256 grid frame correctly:
         # Rows = Azimuth Steered Bins, Columns = Range Delay Bins
         final_power_grid[:, :fill_delay_bins] = power_map[:, :fill_delay_bins]
 
         # Convert to logarithmic decibel scaling
         power_db = 10.0 * np.log10(np.maximum(final_power_grid, 1e-12))
-        
+
         # Apply standard radar contrast clipping thresholds
         floor = float(np.percentile(power_db, 15.0))
         ceiling = float(np.percentile(power_db, 99.5))
@@ -456,25 +452,25 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         # Generate the RGB/RGBA color map matrix matching pixel orientations
         colormap = matplotlib.colormaps.get_cmap("viridis")
-        
-        # Transpose norm_map to align its internal layout columns to the image coordinates
-        color_data = colormap(np.transpose(norm_map)) 
-        np_data = (color_data * 255).astype(np.uint8)
 
+        # Transpose norm_map to align its internal layout columns to the image coordinates
+        color_data = colormap(np.transpose(norm_map))
+        np_data = (color_data * 255).astype(np.uint8)
 
         try:
             from PIL import Image
+
             # Ensure the output directory exists in your working space
             output_dir = pathlib.Path(__file__).resolve().parent / "debug_outputs"
             output_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # np_data is currently (256, 256, 4) in uint8 format (RGBA)
             img = Image.fromarray(np_data, mode="RGBA")
-            
+
             # Save with a static filename to overwrite, or append a timestamp
             output_path = output_dir / "latest_radar_matrix.png"
             img.save(str(output_path))
-            
+
             # Optional: Log a message confirming the capture pass was successful
             # print(f"DEBUG CAPTURE: Saved baseline texture frame to {output_path}", file=sys.stderr)
         except Exception as img_err:
@@ -493,7 +489,6 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         image_vector = np_data.flatten().tolist()
         self.radarMapChanged.emit(image_vector)
 
-
         # FIX: Align array shape metrics directly with the active property outputs
         self._radar_angle_size = int(np_data.shape[1])  # Dynamic texture columns
         self._radar_delay_size = int(np_data.shape[0])  # Dynamic texture rows
@@ -505,8 +500,6 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # Flatten into a strict 262,144 byte RGBA stream (256 * 256 * 4)
         image_vector = np_data.flatten().tolist()
         self.radarMapChanged.emit(image_vector)
-
-
 
     def _angle_fine_corrected_traces(self, traces):
         """Apply the existing relative-phase calibration to all antenna traces."""
@@ -572,7 +565,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._angle_status = "Matched chirp window is empty."
             self.angleChanged.emit()
             return
-        
+
         spatial_samples = np.zeros((row_count, column_count, sample_count), dtype=np.complex64)
         for row in range(row_count):
             for column in range(column_count):
@@ -615,11 +608,10 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # intentionally has one column and must not be indexed by peak_column.
         self._elevation_estimate_deg = float(elevation_grid[peak_row, 0])
 
-
         # 1. Collapse the vertical elevation axis using a Maximum Intensity Projection
         # This keeps the maximum target energy for every horizontal column bin
-        radar_1d_profile = np.max(visible_power, axis=0) # Shape: (column_fft_size,)
-        
+        radar_1d_profile = np.max(visible_power, axis=0)  # Shape: (column_fft_size,)
+
         # 2. Extract the true horizontal azimuth angles for the center row of your FFT grid
         # This gives us the exact physical angles that match each of the 256 columns
         center_row = row_fft_size // 2
@@ -629,14 +621,13 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # This smoothly maps values without the "nearest-neighbor" index jumping artifact
         ui_angles = np.linspace(-90.0, 90.0, 361)
         spectrum_interp = np.interp(ui_angles, fft_native_angles, radar_1d_profile)
-        
+
         max_val = np.max(spectrum_interp)
         normalized_spectrum = spectrum_interp / max_val if max_val > 0 else spectrum_interp
-        
+
         self._angle_spectrum = normalized_spectrum.astype(np.float32)
         self._angle_status = "2D Spatial FFT using configured geometry and internal calibration."
         self.angleChanged.emit()
-
 
     def _set_fft_size(self, n):
         if n == self.fft_size or n < CHUNK_SAMPLES or n % CHUNK_SAMPLES != 0:
@@ -681,7 +672,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         f_start = -bw_hz / 2.0
         f_end = bw_hz / 2.0
         k = (f_end - f_start) / chirp_duration
-        phase = 2.0 * np.pi * (f_start * t + 0.5 * k * (t ** 2))
+        phase = 2.0 * np.pi * (f_start * t + 0.5 * k * (t**2))
         active_chirp = np.exp(1j * phase).astype(np.complex64)
 
         zero_samples = max(0, burst_length - chirp_frames)
@@ -713,7 +704,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         received_energy = np.convolve(np.abs(received) ** 2, np.ones(burst_length), mode="same")
         denominator = np.sqrt(np.maximum(reference_energy * received_energy, 1e-12))
         score = (np.abs(correlation) / denominator).astype(np.float32)
-        plotted_correlation = np.abs(correlation).astype(np.float32);
+        plotted_correlation = np.abs(correlation).astype(np.float32)
 
         threshold = 0.35
         spacing = max(1, reference.size // 4)
@@ -726,7 +717,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             if all(abs(int(index) - peak) >= spacing for peak in peaks):
                 peaks.append(int(index))
         peaks.sort()
-        return correlation,plotted_correlation, peaks
+        return correlation, plotted_correlation, peaks
 
     def _angle_matched_trace(self, iq):
         """Return complex matched-filter output for the active chirp."""
@@ -850,7 +841,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtProperty(bool, notify=txStateChanged)
     def txActive(self):
-        return getattr(self, '_tx_waveform', None) is not None
+        return getattr(self, "_tx_waveform", None) is not None
 
     @PyQt6.QtCore.pyqtProperty(bool, notify=displayModeChanged)
     def constellation(self):
@@ -870,11 +861,11 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtProperty(int, constant=True)
     def boardCount(self):
-        return len(self.pool.boards) if hasattr(self, "pool") else 1
+        return len(self.receiver.boards) if hasattr(self, "receiver") else 1
 
     @PyQt6.QtCore.pyqtProperty("QVariantList", constant=True)
     def boardHosts(self):
-        return [b.host for b in self.pool.boards] if hasattr(self, "pool") else []
+        return [b.host for b in self.receiver.boards] if hasattr(self, "receiver") else []
 
     @PyQt6.QtCore.pyqtProperty(bool, notify=displayModeChanged)
     def radarMode(self):
@@ -885,6 +876,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         return self._radar_status
 
         # Ensure this property setup section explicitly matches the demo footprint
+
     @PyQt6.QtCore.pyqtProperty(int, constant=False, notify=radarConfigChanged)
     def angleSize(self):
         # The copied shader looks directly for 'angleSize' to parse the horizontal texture columns
@@ -905,15 +897,12 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # Maps to the maximum delay cells inside your 256 matrix layout
         return 256
 
-
-
-
     @PyQt6.QtCore.pyqtSlot(int)
     def set_active_board(self, index):
         """Tab switch: render this board's waterfalls (only the active board
         is rendered — with 4+ boards rendering everything is too costly; the
         clusters span all boards, so switching just changes the slice)."""
-        if index == self.active_board or not hasattr(self, "pool") or not (0 <= index < len(self.pool.boards)):
+        if index == self.active_board or not hasattr(self, "receiver") or not (0 <= index < len(self.receiver.boards)):
             return
         self.active_board = index
         self.block_acc = {}
@@ -945,19 +934,20 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         self.render_running = True
         threading.Thread(target=self._render, daemon=True).start()
+
     def _publish_sample_windows(self, traces):
         """Publish coherent display windows for the GUI-thread Qt Charts."""
-        
+
         # 1. Include "radar" in the active radar pre-processing context
         if self._tx_waveform is not None and self.display_mode in ("ping", "angle", "radar") and traces:
             # Coherently compress incoming chirps into sharp range profile peaks
             matched_traces = {antid: self._angle_matched_trace(trace) for antid, trace in traces.items()}
             common_length = min((t.size for t in matched_traces.values()), default=0)
-            
+
             if common_length > 0:
                 matched_traces = {antid: t[:common_length] for antid, t in matched_traces.items()}
                 common_power = np.sum([np.abs(t) ** 2 for t in matched_traces.values()], axis=0)
-                
+
                 # Route appropriate domains based on active mode context
                 if self.display_mode in ("angle", "radar"):
                     # Angle and Radar modes expect pulse-compressed matched-filter vectors
@@ -991,14 +981,12 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self.angleChanged.emit()
 
         # Fix: Feed the pre-matched cached window structure to the map renderer
-        if self.display_mode == "radar" and traces: 
+        if self.display_mode == "radar" and traces:
             with self._sample_window_lock:
                 # Use a thread-safe snapshot clone from the cached buffer
                 current_snapshot = {sensor_id: self._sample_windows[sensor_id].copy() for sensor_id in range(SENSOR_COUNT) if self._sample_window_present[sensor_id]}
             if len(current_snapshot) == SENSOR_COUNT:
                 self._render_radar_heatmap(current_snapshot)
-
-
 
     @PyQt6.QtCore.pyqtSlot(int, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QScatterSeries, result="QVariantMap")
     def updateTimeChart(self, antid, i_series, q_series, correlation_series, peak_series):
@@ -1012,7 +1000,6 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             iq = self._sample_windows[antid].copy()
             self._time_trace_consumed[antid] = generation
             all_traces = {sensor_id: samples.copy() for sensor_id, samples in enumerate(self._sample_windows)}
-        
 
         i_series.replace([PyQt6.QtCore.QPointF(x, float(y)) for x, y in enumerate(iq.real)])
         q_series.replace([PyQt6.QtCore.QPointF(x, float(y)) for x, y in enumerate(iq.imag)])
@@ -1087,10 +1074,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if spectrum.size == 0 or not np.all(np.isfinite(spectrum)):
             series.replace([])
             return
-        points = [
-            PyQt6.QtCore.QPointF(-90.0 + index * 180.0 / max(1, spectrum.size - 1), float(value))
-            for index, value in enumerate(spectrum)
-        ]
+        points = [PyQt6.QtCore.QPointF(-90.0 + index * 180.0 / max(1, spectrum.size - 1), float(value)) for index, value in enumerate(spectrum)]
         series.replace(points)
 
     def _refresh_spectrum_config(self):
@@ -1100,7 +1084,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         self._spectrum_config_read_at = now
         try:
-            cfg = self.pool.get_config()
+            cfg = self.receiver.get_config()
             sample_rate_hz = DECIM_TO_FS.get(int(cfg.get("adc_decimation", 1)), DECIM_TO_FS[1])
             receivers = cfg.get("receivers", [])
             center_hz = float(receivers[0].get("rf_freq_hz", 2437e6)) if receivers else 2437e6
@@ -1130,9 +1114,9 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         with self._pending_lock:
             clusters, self._pending_clusters = self._pending_clusters, []
         board = self.active_board
-        if not clusters or board >= len(self.pool.boards):
+        if not clusters or board >= len(self.receiver.boards):
             return []
-        revision = self.pool.boards[board].revision
+        revision = self.receiver.boards[board].revision
         positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
         sets = []
         for cluster in clusters:
@@ -1140,13 +1124,9 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 completion = cluster.section_completion
                 sections = cluster.iq_sections
                 for lane in range(cluster.vector_chunks):
-                    per = {
-                        antid: sections[board, row, col, lane]
-                        for antid, (row, col) in enumerate(positions)
-                        if completion[board, row, col, lane]
-                    }
+                    per = {antid: sections[board, row, col, lane] for antid, (row, col) in enumerate(positions) if completion[board, row, col, lane]}
                     if per:
-                        sets.append((cluster.source_chunk_start + lane, per))
+                        sets.append((cluster.chunk_index + lane, per))
             else:
                 completion = cluster.completion
                 iq = cluster.iq
@@ -1269,25 +1249,22 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """After the framework pool is up: expose the pool's QML adapter,
         subscribe the display to delivered clusters, and enter IQ mode. Sync
         (anchors from WiFi packets) BEFORE entering IQ."""
-        hosts = ", ".join(b.host for b in self.pool.boards)
-        self.logger.info(f"IQ capture starting ({len(self.pool.boards)} board(s): {hosts})")
+        hosts = ", ".join(b.host for b in self.receiver.boards)
+        self.logger.info(f"IQ capture starting ({len(self.receiver.boards)} board(s): {hosts})")
         self.iqcontrol = self.create_iq_controller()
         self.iqcontrol.set_apply_calibration(bool(self.appconfig.get("apply_calibration")))
         self.iqcontrol.calibrationChanged.connect(self._on_iq_calibration_changed)
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
         # the display also wants settled partial sets (missing sensors render
         # as placeholder rows instead of stalling the waterfall)
-        self.pool.add_iq_callback(self._on_iq_cluster, include_partial=True)
-        self.pool.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_callback(self._on_iq_cluster, include_partial=True)
+        self.receiver.add_accumulation_callback(self._on_iq_cluster, include_partial=True)
 
         def _enter():
             try:
                 self.logger.info("acquiring array-wide time sync...")
-                self.pool.sync()
+                self.pool.calibrate()
                 self.logger.info("time sync done, switching the array to IQ sampling mode...")
-                cfg = self.pool.get_config()
-                cfg["mode"] = "iq"
-                self.pool.apply_config(cfg)
                 self.logger.info("IQ mode entered; waiting for synchronized chunk sets...")
             except Exception as e:
                 self.logger.error(f"could not enter IQ mode: {e}")
@@ -1340,6 +1317,7 @@ class EspargosSignalAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._abort_if_stuck()
             return -1
         return super().exec()
+
 
 if __name__ == "__main__":
     app = EspargosSignalAnalyzer(sys.argv)

@@ -12,6 +12,7 @@ import zlib
 import numpy as np
 
 from .iq_tx_control import TXStatus, _SensorTXError, _rpc, _waveform
+from .board import EspargosHTTPStatusError
 from .waveforms import IQSamples
 from .tx_signal import TXSignals
 
@@ -88,7 +89,19 @@ class IQTransmitter:
                     if muted:
                         return
                     raise PermissionError(f"{b.host}: enable transmit authorization in controller Settings")
-                _rpc(b, "set_iq_tx", {"muted": muted})
+                before = None
+                if self.capture is not None:
+                    with self.capture.changed:
+                        before = [s["sequence"] if s is not None else None for s in self.capture.status[b]]
+                try:
+                    _rpc(b, "set_iq_tx", {"muted": muted})
+                except EspargosHTTPStatusError as error:
+                    if not muted or error.status != 503 or self.capture is None:
+                        raise
+                    # Settings may have applied before JSON serialization
+                    # failed. Require a fresh streamed acknowledgement of
+                    # silence instead of treating that HTTP response as proof.
+                    self.capture.wait(b, lambda s: all((before[a] is None or x["sequence"] != before[a]) and (not x["enabled"] or abs(x["applied_amplitude"]) < 1e-8) for a, x in enumerate(s["sensors"])), 10)
                 return self.capture.wait(b, lambda s: all(not x["enabled"] or abs(x["applied_amplitude"]) < 1e-8 for x in s["sensors"]), 10) if muted and self.capture is not None else None
 
             self._parallel(apply)

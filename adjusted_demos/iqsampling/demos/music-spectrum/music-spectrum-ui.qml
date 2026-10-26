@@ -3,11 +3,12 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtCharts
 import QtQuick
-import "../common" as Common
+import "../../../../demos/common" as Common
+import "../../../../demos/wifi/common" as WiFi
 
 Common.ESPARGOSApplication {
 	id: window
-	receiverDrawerComponent: Component { Common.CSIReceiverDrawer {} }
+	receiverDrawerComponent: Component { WiFi.WiFiTransceiverDrawer {} }
 	visible: true
 	minimumWidth: 800
 	minimumHeight: 500
@@ -21,7 +22,7 @@ Common.ESPARGOSApplication {
 			title: "Settings"
 			endpoint: appconfig
 
-			Common.CSIAppSettings {
+			WiFi.CSIAppSettings {
 				id: genericAppSettings
 				insertBefore: genericAppSettingsAnchor
 			}
@@ -34,7 +35,7 @@ Common.ESPARGOSApplication {
 				visible: false
 			}
 
-			Common.CSIBacklogSettings {
+			WiFi.CSIBacklogSettings {
 				id: backlogSettings
 				insertBefore: backlogSettingsAnchor
 			}

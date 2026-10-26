@@ -2,11 +2,11 @@
 
 """IQ-sampling addon for pyespargos.
 
-Importing this package registers the ``iq`` Board capability, which provides
+This package re-exports the native ``iq`` types, which provide
 IQ capture configuration, reference tone control, sync anchors and the IQ
 chunk stream (``board.iq``).
 
-The IQ data path mirrors the CSI stack: :class:`.IQPool` assembles the boards'
+The IQ data path mirrors the CSI stack: :class:`.IQReceiver` assembles the boards'
 chunk streams into synchronized :class:`.IQCluster` snapshots and manages the
 IQ-mode lifecycle (configuration, array-wide time sync, reference tone, fine
 calibration), and :class:`.IQBacklog` stores delivered clusters in a ring
@@ -17,26 +17,20 @@ demo framework.
 
 import espargos as _espargos
 
-from . import board_iq
-from . import iq_backlog
-from . import iq_cluster
-from . import iq_packet
-from . import iq_pool
-from . import iq_sync
 from . import iq_tone
 from . import spatial
-from .board_iq import IQCapability
-from .iq_backlog import IQBacklog, IQBacklogFilter
-from .iq_accum_cluster import IQAccumCluster
-from .iq_cluster import CHUNK_SAMPLES, IQCluster
-from .iq_signal_capture import (
+from espargos.board_iq import IQCapability
+from espargos.iq_backlog import IQBacklog, IQBacklogFilter
+from espargos.iq_accum_cluster import IQAccumCluster
+from espargos.iq_cluster import CHUNK_SAMPLES, IQCluster
+from espargos.iq_signal_capture import (
     IQ_SIGNAL_BANK_CHUNKS,
     IQ_SIGNAL_MAX_CAPTURE_CHUNKS,
     IQSignalAssembler,
     IQSignalCapture,
 )
 from .wifi_legacy import LegacyOFDMFrame, decode_legacy_ofdm, decode_legacy_ofdm_all
-from .iq_packet import (
+from espargos.iq_packet import (
     IQ_ACCUM_TYPE_HEADER,
     IQ_CHUNK_FLAG_SIGNAL_CAPTURE,
     IQ_CHUNK_FLAG_SIGNAL_FIRST,
@@ -46,6 +40,6 @@ from .iq_packet import (
     IQAccumPacket,
     IQChunkPacket,
 )
-from .iq_pool import DECIM_TO_FS, SENSOR_COUNT, IQCalibrationError, IQPool, iq_receiver_config
+from espargos.iq_receiver import DECIM_TO_FS, SENSOR_COUNT, IQCalibrationError, IQReceiver, iq_receiver_config
 
-_espargos.Board.register_capability("iq", IQCapability)
+# IQ is registered by pyespargos. Never replace its current board capability.
