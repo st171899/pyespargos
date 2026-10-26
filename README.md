@@ -2,82 +2,22 @@
 
 <img src="img/espargos-logo.png" width="40%" align="right">
 
-*pyespargos* is the Python library for working with the [ESPARGOS](https://espargos.net/) WiFi channel sounder.
-ESPARGOS is a real-time-capable, phase-synchronous 2 &times; 4 WiFi antenna array built from Espressif ESP32 chips that facilitates the development and deployment of WiFi sensing applications.
+*pyespargos* is the Python library for working with [ESPARGOS](https://espargos.net/), a low-cost digital phased array built from Espressif ESP32 chips.
+An ESPARGOS array contains eight phase-synchronized ESP32 radio front-ends, one per antenna, that are orchestrated by a central controller.
+The current hardware, [ESPARGOS One](https://espargos.net/espargos-one/), is a 4 &times; 2 array of dual-polarized patch antennas for the 2.4 GHz band and is controlled and powered over Ethernet (PoE) or USB-C.
+Multiple arrays can be combined into one larger phase-coherent aperture.
 
-The library supports combining multiple ESPARGOS arrays into larger antenna arrays, various CSI preamble formats (L-LTF, HT20, HT40), and provides a flexible calibration system for multi-board setups.
+With *pyespargos*, you can use ESPARGOS to
 
-## Different Hardware Revisions
-<table>
-	<tr>
-		<th width="50%">Your ESPARGOS looks like this:</th>
-		<th width="50%">Your ESPARGOS looks like this:</th>
-	</tr>
-	<tr>
-		<td width="50%"><img src="img/espargosv2.jpg" width="100%"></td>
-		<td width="50%"><img src="img/espargosv1.jpg" width="100%"></td>
-	</tr>
-	<tr>
-		<td width="50%">&rarr; You have the current ESPARGOS, please use the <code>main</code> branch of this repository.</td>
-		<td width="50%">&rarr; You have the older prototype generation of ESPARGOS, please use the <code>legacy-prototype</code> branch of this repository. This hardware revision is no longer supported.</td>
-	</tr>
-</table>
+* **measure WiFi channels**: ESPARGOS passively extracts channel state information (CSI) from received 802.11g/n/ax packets in real time, phase-coherent across all antennas and arrays. Supported formats are L-LTF, HT-LTF (20 and 40 MHz) and HE-LTF.
+* **capture raw I/Q samples**: ESPARGOS can record synchronized complex baseband samples from all antennas, bypassing WiFi decoding (see [ESP-SDR](https://espargos.net/espsdr/)). This is useful for non-WiFi signals and radar-like measurements.
+* **transmit** (requires transmit authorization): sensors can send WiFi packets on a schedule, or replay arbitrary I/Q waveforms with beam steering across the array.
 
-## Demo Applications
-<table style="max-width: 800px;">
-	<tr>
-		<th style="text-align: center;">MUSIC Spatial Spectrum</th>
-		<th style="text-align: center;">Receive Signal Phase by Antenna</th>
-	</tr>
-	<tr>
-		<td style="text-align: center;"><img src="img/demo-gifs/music-spatial-spectrum.gif" width="100%"></td>
-		<td style="text-align: center;"><img src="img/demo-gifs/phases-over-space.gif" width="100%"></td>
-	</tr>
-	<tr>
-		<th style="text-align: center;">Instantaneous CSI: Frequency Domain</th>
-		<th style="text-align: center;">Instantaneous CSI: Time Domain</th>
-	</tr>
-	<tr>
-		<td style="text-align: center;"><img src="img/demo-gifs/instantaneous-fdomain-csi.gif" width="100%"></td>
-		<td style="text-align: center;"><img src="img/demo-gifs/instantaneous-tdomain-csi.gif" width="100%"></td>
-	</tr>
-	<tr>
-		<th style="text-align: center;">Phases over Time</th>
-		<th style="text-align: center;">Combined 8 &times; 4 ESPARGOS Array</th>
-	</tr>
-	<tr>
-		<td style="text-align: center;"><img src="img/demo-gifs/phases-over-time.gif" width="100%"></td>
-		<td style="text-align: center;"><img src="img/demo-gifs/combined-array.gif" width="100%"></td>
-	</tr>
-</table>
+The library handles device communication, clustering of measurements across sensors and boards, and phase/timing calibration, and provides array-processing utilities such as angle-of-arrival estimation.
+It also ships with a collection of demo applications, listed below.
+Full documentation, including runnable examples and the API reference, is available at [espargos.net/docs](https://espargos.net/docs/).
 
-*pyespargos* comes with a selection of demo applications for testing ESPARGOS.
-Receive demos are built on a common application framework (`demos/common`) that provides:
-* A consistent command-line interface and YAML configuration support
-* A graphical pool management drawer for connecting to ESPARGOS devices
-* Selectable preamble formats (L-LTF, HT20, HT40)
-* Configurable CSI backlog settings
-
-The following demos are provided in the `demos` folder of this repository:
-
-| Demo | Description |
-|------|-------------|
-| `iq-transmit-beamforming` | Control up to four TX beams across a single or combined array, with waveform generation/upload, beamspace steering, RX/TX calibration and a reference monitor. See [usage](demos/iq-transmit-beamforming/README.md). |
-| `iq-signal-analyzer` | Display synchronized raw IQ as power/phase waterfalls, I/Q traces, constellations, and spectra. Supports Interval, Accumulate, and Signal capture; see [usage](demos/iq-signal-analyzer/README.md). |
-| `music-spectrum` | Use the [MUSIC algorithm](https://en.wikipedia.org/wiki/MUSIC_(algorithm)) to display a spatial (angular) spectrum. Demonstrates angle of arrival (AoA) estimation. |
-| `phases-over-space` | Show the average received phase for each ESPARGOS antenna. |
-| `instantaneous-csi` | Plot the current frequency-domain or time-domain transfer function of the measured channel. |
-| `phases-over-time` | Plot the average received phase for every antenna over time. |
-| `tdoas-over-time` | Visualize time difference of arrival (TDOA) measurements over time. |
-| `azimuth-delay` | Display a 2D azimuth-delay diagram using beamspace processing. Ships with pre-compiled shaders; see [`demos/azimuth-delay/README.md`](demos/azimuth-delay/README.md) in case of shader issues. |
-| `polarization` | Visualize WiFi signal polarization using constellation diagrams and polarization ellipses. |
-| `speedtest` | Measure CSI packet throughput from ESPARGOS. |
-| `combined-array` | Combine multiple ESPARGOS arrays into one large antenna array and visualize the average received phase for each antenna. Requires multiple ESPARGOS arrays. |
-| `combined-array-calibration` | Tool for calibrating combined multi-board antenna arrays. Visualizes and exports calibration data. |
-| `camera` | Overlay WiFi spatial spectrum on a live camera feed. Ships with pre-compiled shaders; see [`demos/camera/README.md`](demos/camera/README.md) in case of shader issues. |
-| `radiation-pattern-3d` | Interactive 3D radiation pattern visualization. Requires additional packages (see [`demos/radiation-pattern-3d/README.md`](demos/radiation-pattern-3d/README.md)). |
-
-Most demos support both single ESPARGOS arrays and combined multi-board setups via command-line arguments or YAML configuration files.
+<p align="center"><a href="https://espargos.net/espargos-one/"><img src="img/espargos-one-banner.svg" width="900" alt="ESPARGOS One: Digital Phased Array for 2.4 GHz"></a></p>
 
 ## Installation
 
@@ -161,7 +101,6 @@ sudo pacman -S qt6-shadertools
 ---
 
 ### <img src="img/windows-logo.svg" width="20" height="20" style="vertical-align: middle;"> Windows
-*(not recommended)*
 
 <details>
 <summary><b>Click to expand Windows instructions</b></summary>
@@ -221,7 +160,6 @@ Demos such as `camera` and `azimuth-delay` use shaders, which are shipped in pre
 ---
 
 ### <img src="img/macos-logo.svg" width="20" height="20" style="vertical-align: middle;"> macOS
-*(not recommended)*
 
 <details>
 <summary><b>Click to expand macOS instructions</b></summary>
@@ -294,7 +232,37 @@ qsb --version
 
 </details>
 
----
+## Demo Applications
+<table>
+  <tr>
+    <td align="center" width="33%"><a href="demos/wifi/camera"><b>Camera Overlay</b></a><br><img src="img/demo-gifs/camera.gif" alt="Camera Overlay preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/iq/mimo-radar"><b>MIMO Radar</b></a><br><img src="img/demo-gifs/mimo-radar.gif" alt="MIMO Radar preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/wifi/azimuth-delay"><b>Azimuth-Delay Diagram</b></a><br><img src="img/demo-gifs/azimuth-delay.gif" alt="Azimuth-Delay Diagram preview" width="240" height="150"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><a href="demos/wifi/music-spectrum"><b>MUSIC Spatial Spectrum</b></a><br><img src="img/demo-gifs/music-spatial-spectrum.gif" alt="MUSIC Spatial Spectrum preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/wifi/phases-by-antenna"><b>Phases by Antenna</b></a><br><img src="img/demo-gifs/phases-by-antenna.gif" alt="Phases by Antenna preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/wifi/instantaneous-csi"><b>Instantaneous Frequency-Domain CSI</b></a><br><img src="img/demo-gifs/instantaneous-fdomain-csi.gif" alt="Instantaneous Frequency-Domain CSI preview" width="240" height="150"></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><a href="demos/wifi/instantaneous-csi"><b>Instantaneous Time-Domain CSI</b></a><br><img src="img/demo-gifs/instantaneous-tdomain-csi.gif" alt="Instantaneous Time-Domain CSI preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/wifi/phases-over-time"><b>Received Phases over Time</b></a><br><img src="img/demo-gifs/phases-over-time.gif" alt="Received Phases over Time preview" width="240" height="150"></td>
+    <td align="center" width="33%"><a href="demos/wifi/tdoas-over-time"><b>Time of Arrival</b></a><br><img src="img/demo-gifs/tdoa-over-time.gif" alt="Time of Arrival preview" width="240" height="150"></td>
+  </tr>
+</table>
+
+*pyespargos* comes with a selection of demo applications for testing ESPARGOS.
+Receive demos are built on a common application framework (`demos/common`) that provides:
+* A consistent command-line interface and YAML configuration support
+* A graphical pool management drawer for connecting to ESPARGOS devices
+* Selectable preamble formats (L-LTF, HT20, HT40)
+* Configurable CSI backlog settings
+
+Demos are grouped by signal type: [`demos/wifi`](demos/wifi) for WiFi/CSI and
+[`demos/iq`](demos/iq) for raw IQ reception and transmission. Shared components
+are in `demos/common`. Use [`demos/custom`](demos/custom) for local experiments.
+
+Most demos support both single ESPARGOS arrays and combined multi-board setups via command-line arguments or YAML configuration files.
 
 ### Running a Demo
 
@@ -305,18 +273,18 @@ For example, to run the **Instantaneous CSI** demo with an ESPARGOS controller a
 
 **Linux / macOS:**
 ```bash
-./demos/instantaneous-csi/instantaneous-csi.py 192.168.1.2
+./demos/wifi/instantaneous-csi/main.py 192.168.1.2
 ```
 
 **Windows (Command Prompt):**
 ```cmd
-python demos\instantaneous-csi\instantaneous-csi.py 192.168.1.2
+python demos\wifi\instantaneous-csi\main.py 192.168.1.2
 ```
 
 If you have multiple ESPARGOS boards, pass their addresses separated by commas:
 
 ```
-python demos/instantaneous-csi/instantaneous-csi.py 192.168.1.2,192.168.1.3
+python demos/wifi/instantaneous-csi/main.py 192.168.1.2,192.168.1.3
 ```
 
 Other demos may ask for different command line arguments.
@@ -359,13 +327,13 @@ Use the format `uart:<serial-device>`.
 For example, to run the **Instantaneous CSI** demo over USB on Linux:
 
 ```bash
-./demos/instantaneous-csi/instantaneous-csi.py uart:/dev/ttyUSB0
+./demos/wifi/instantaneous-csi/main.py uart:/dev/ttyUSB0
 ```
 
 On Windows:
 
 ```cmd
-python demos\instantaneous-csi\instantaneous-csi.py uart:COM3
+python demos\wifi\instantaneous-csi\main.py uart:COM3
 ```
 
 In your own Python code, pass the same host string to `espargos.Board`:
@@ -380,124 +348,21 @@ If you need to override the default UART baud rate, append it after `@`, for exa
 
 ---
 
-### Custom Applications: Quick Start
+### Writing Your Own Application
 
-To create your own ESPARGOS-based application, you have two options:
-* Use the Python + PyQt6 + QML framework used by the other demos. This is the fastest way to get up and running, just start by modifying an existing demo.
-* Write your application from scratch using only the `pyespargos` library
+To build your own ESPARGOS application, either start from one of the demos (they share the application framework in `demos/common`) or use the `espargos` package directly.
+Runnable minimal examples, the API reference and explanations of pools, calibration, WiFi reception/transmission and IQ reception/transmission are in the [pyespargos documentation](https://espargos.net/docs/).
 
-#### Applications from Scratch
+## Older Prototype Hardware
 
-After installation, import the `espargos` package in your Python application. Use this minimal sample code to get started:
+<img src="img/espargosv1.jpg" width="30%" align="right">
 
-```python
-#!/usr/bin/env python
+If your ESPARGOS looks like the board on the right, you have the older prototype generation from before ESPARGOS One.
+These prototypes were never sold, they were only ever distributed as free-of-charge loans to selected research partners.
+Please use the [`legacy-prototype`](https://github.com/ESPARGOS/pyespargos/tree/legacy-prototype) branch of this repository.
+This hardware revision is no longer supported.
 
-import espargos
-import time
-
-pool = espargos.CSIPool([espargos.Board("192.168.1.2")])
-pool.set_csi_acquisition_config({"acquire_csi_force_lltf": True})
-pool.start()
-backlog = None
-try:
-    pool.calibrate(duration=2)
-    backlog = espargos.CSIBacklog(
-        pool,
-        fields=["lltf", "rssi"],
-        size=20,
-    )
-    backlog.add_filter(espargos.Exclude11bFilter())
-    backlog.start()
-
-    # Wait a moment so the backlog can collect some WiFi packets.
-    time.sleep(4)
-
-    if backlog.has_data:
-        csi_lltf, rssi = backlog.get_multiple(("lltf", "rssi"))
-        print("L-LTF backlog shape:", csi_lltf.shape)
-        print("RSSI backlog:", rssi)
-    else:
-        print("No CSI data received yet.")
-finally:
-    if backlog is not None:
-        backlog.stop()
-    pool.stop()
-```
-
-## Basics
-
-### WiFi
-* ESPARGOS extracts channel state information (CSI) from WiFi training fields received by the sensor ESP32s.
-* During normal CSI capture, ESPARGOS is passive: it receives packets in promiscuous mode and reports CSI for packets it can decode. The radar mode described below is the exception because it actively transmits measurement frames.
-* To receive over-the-air packets, the transmitter and ESPARGOS must use the same primary channel and compatible bandwidth settings.
-* The current firmware and *pyespargos* support these CSI formats:
-  - **L-LTF** (`lltf`): legacy long training field from 802.11g-style packets, represented as 53 subcarriers (`-26..26`, with DC reconstructed/interpolated when needed). In fact, even the newer HT/HE packets contain L-LTF fields. In a **force L-LTF** mode you can change the behavior of ESPARGOS to *always* extract the L-LTF CSI instead of the other training fields. The L-LTF CSI supports 12-bit encoding of the real and imaginary components (instead of just 8-bit encoding like the other preamble formats), which makes this mode preferable for situations in which dynamic range is important.
-  - **HT20** (`ht20`): 802.11n HT-LTF for 20 MHz packets, represented as 57 subcarriers (`-28..28`).
-  - **HT40** (`ht40`): 802.11n HT-LTF for 40 MHz channel bonding, represented as 117 bins (`-58..58`, including the 3-bin gap between the bonded channels).
-  - **HE20** (`he20`): 802.11ax HE-LTF for 20 MHz packets, represented as 245 bins (`-122..122`, with invalid/null tones around DC zeroed by *pyespargos*).
-* 802.11b packets do not carry CSI. *pyespargos* can filter them out with `Exclude11bFilter`.
-* CSI can be transported either as raw coefficients or in the firmware's compressed time-domain representation; *pyespargos* decodes both into complex NumPy arrays.
-
-### Communication between pyespargos and ESPARGOS
-* The controller exposes a small HTTP API for identification, configuration, RF switch control, calibration, gain settings, MAC filtering and radar/TX configuration.
-* `Board` owns controller identity, transport and raw sensor-message delivery. Feature-specific operations are grouped into lazily created capabilities: receive/CSI controls live on `board.wifi_rx`, while scheduled-transmission controls live on `board.wifi_tx`.
-* Extensions can register another capability with `Board.register_capability(name, factory)`. The resulting API is available as `board.<name>` without changing how applications construct a board. A capability can use the public, transport-independent `board.control` request interface instead of depending on HTTP or UART internals.
-* On Ethernet, *pyespargos* sends control commands via HTTP and receives the sensor-message stream, including CSI and radar TX reports, through:
-  - **UDP** (default): lower latency and higher throughput. *pyespargos* opens a local UDP socket, asks the controller to stream to it through `/stream_udp`, waits for a magic packet, and sends periodic keepalives to keep firewall/NAT state alive. Older controllers expose the same operation as `/csi_udp`, which remains supported as a fallback.
-  - **WebSocket** (`/stream`): more compatible transport and the endpoint used by recent versions of the web interface. Controllers from before the generic endpoint was introduced expose the same sensor stream as `/csi`, which *pyespargos* retains as a fallback.
-* Over USB, *pyespargos* accepts UART host specifiers such as `uart:/dev/ttyUSB0` or `uart:COM3`. Control RPCs and sensor-message streaming are then tunnelled over the serial link.
-* `Board.start()` chooses transports automatically: network hosts try UDP first and fall back to WebSocket; UART hosts use the UART transport.
-* After reassembling sensor messages, `Board` dispatches them through callbacks filtered by their four-byte type header. Callbacks receive the raw `SensorMessage`, including its UID and antenna ID. Capabilities own format-specific parsing: `board.wifi_rx.subscribe_csi(...)` delivers decoded CSI, and `board.wifi_tx.subscribe_reports(...)` delivers decoded transmit reports. Optional features can do the same without adding their formats to `board.py`.
-* Only one sensor-message stream transport can be active on a controller at a time. The UART router and direct *pyespargos* UART access also need exclusive access to the serial device.
-
-### The Backlog
-* Individual WiFi training fields are short, so single-packet CSI is often noisy. Many applications work on a recent window of packets instead of only the newest packet.
-* `CSIBacklog` keeps the last N CSI clusters in a ringbuffer and lets application code read consistent snapshots with `get()` or `get_multiple()`.
-* Backlog fields are configurable. Current fields include `lltf`, `ht20`, `ht40`, `he20`, `rssi`, `cfo`, `rf_switch_state`, `timestamp`, `host_timestamp`, `mac`, `radar_tx_timestamp` and `radar_tx_index`.
-* CSI fields are stored as complex NumPy arrays with shape `(datapoints, boards, rows, antennas, subcarriers)`. Per-antenna metadata uses the same board/row/antenna layout.
-* By default, `CSIBacklog` applies the pool calibration before storing CSI. Pass `apply_calibration=False` if you need raw, uncalibrated CSI, or change the `apply_calibration` property at runtime.
-* Backlog filters such as `MACFilter` and `Exclude11bFilter` can drop packets before they enter the ringbuffer.
-* Utility functions in `espargos/util.py` provide common CSI post-processing helpers, including subcarrier frequency axes, gap interpolation, feed separation, time-domain transforms and AoA/ToA helpers.
-
-### CSI Clustering
-* Each sensor reports CSI separately. `CSIPool` groups those sensor reports into `CSICluster` objects that represent one WiFi packet across one or more ESPARGOS boards.
-* Clustering uses a `WiFiFrameKey` containing source/destination MAC addresses and sequence control, with separate caches for calibration packets and over-the-air packets.
-* A cluster tracks which sensors have reported, so applications can wait for all antennas or provide a custom callback predicate for partial clusters.
-* An identical report from the same sensor is treated as a harmless duplicate. If the same sensor reports different data for an existing frame key, *pyespargos* logs a rate-limited collision warning, keeps the established cluster, and drops the incoming report.
-* Applications drive clustering by calling `CSIPool.run()`. A call waits up to its timeout for the first message and processes one bounded batch. Use `timeout=0` in GUI/event loops; dedicated workers may use a longer timeout such as `0.5` seconds.
-* `CSICluster` exposes deserializers for `lltf`, `ht20`, `ht40` and `he20`, plus metadata such as RSSI, CFO, RF switch state, source MAC, primary/secondary channel, host timestamp and per-sensor hardware timestamps.
-* The deserializers also apply format-specific corrections such as STO/CFO phase correction and HE20 null-tone handling.
-* If you use `CSIBacklog`, clustering happens underneath it and you usually only interact with the backlog arrays.
-
-### Calibration
-* ESPARGOS uses a shared 40 MHz reference clock so the sensor ESP32s are frequency-synchronous.
-* The remaining per-sensor LO phase ambiguity is estimated from calibration packets that are distributed over known PCB traces / reference paths.
-* With *pyespargos*, calibration is usually performed with `pool.calibrate(duration=...)`. The resulting `CSICalibration` stores phase calibration values for L-LTF, HT20, HT40 and HE20, plus per-sensor clock offsets.
-* If some formats are missing during calibration, *pyespargos* can derive compatible calibration values where possible, for example deriving L-LTF calibration from HT20 packets or deriving HE20 calibration from L-LTF timing/phase information.
-* `CSICalibration` applies phase-only calibration to CSI and can compensate board-specific trace delays. For multi-board setups, it can also compensate external sync-cable lengths and velocity factors.
-* Calibration is tied to the WiFi channel configuration used when it was collected. Recalibrate after changing primary/secondary channel settings or after changing the synchronization topology.
-
-### Multi-Board / Combined Arrays
-* *pyespargos* supports pools with one or more ESPARGOS boards. A multi-board `CSIPool` clusters packets across all boards and presents CSI in `(boards, rows, antennas, subcarriers)` layout.
-* Board revisions are detected from the controller API, and board-specific calibration trace delays are applied automatically.
-* For combined arrays, pass external sync-cable lengths / velocity factors when creating calibration data so phase offsets caused by the synchronization distribution are compensated.
-* `reference_generator_boards` can be used when separate ESPARGOS controllers generate calibration packets but are not part of the receive array.
-* Helpers in `espargos/util.py` can map board data into larger array layouts, and the `combined-array` / `combined-array-calibration` demos show typical workflows.
-
-### Radar / controlled transmissions
-* In addition to passive CSI capture, the current firmware exposes low-level radar/TX configuration through the controller API.
-* `board.wifi_tx.set_config()` / `CSIPool.set_radar_config()` configure per-antenna transmit activity, timing, MAC addresses, PHY mode/rate and TX power.
-* Radar packets can carry TX metadata. `CSICluster` and `CSIBacklog` expose this through fields such as `radar_tx_timestamp` and `radar_tx_index`, which are useful when correcting CSI using known transmit timing.
-* The `espargos.radar` helpers provide higher-level utilities for building radar pool configurations and correcting radar CSI phase using TX timestamps.
-* This mode is *experimental* and the APIs are *unstable*.
-
-## Additional Non-Public Demo Applications
-* `dataset-recorder`: Application to record ESPARGOS datasets for publication on [https://espargos.net/datasets/](https://espargos.net/datasets/). Please contact me to get access.
-* `realtime-localization`: Real-time Localization Demo: Channel Charting vs. Triangulation vs. Supervised Training. Requires multiple ESPARGOS. Please contact me to get access.
-<p>
-	<img src="img/demo-gifs/realtime-localization.gif" style="width: 50%; max-width: 400px;">
-</p>
+<br clear="right">
 
 ## License
 `pyespargos` is licensed under the GNU Lesser General Public License version 3 (LGPLv3), see `LICENSE` for details.
