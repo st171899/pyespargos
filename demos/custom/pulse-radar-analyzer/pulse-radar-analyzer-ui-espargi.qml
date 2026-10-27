@@ -25,6 +25,30 @@ Common.ESPARGOSApplication {
 	// Front view of the array: top row antids 4..7, bottom row 0..3
 	property var frontViewRows: [[4, 5, 6, 7], [0, 1, 2, 3]]
 
+    component RadarRangeField: TextField {
+        id: rangeField
+        required property bool upperBound
+        readonly property real sample: upperBound ? backend.delayMax : backend.delayMin
+        readonly property real meters: (sample - backend.radarZeroSample) * backend.radarMetersPerSample
+        enabled: isFinite(backend.radarZeroSample)
+        placeholderText: "Calibrate range first"
+        Layout.fillWidth: true
+        selectByMouse: true
+        validator: DoubleValidator { locale: "C"; notation: DoubleValidator.StandardNotation }
+        function refresh() {
+            text = isFinite(meters) ? meters.toFixed(3) : "";
+        }
+        onMetersChanged: if (!activeFocus) refresh()
+        Component.onCompleted: refresh()
+        onEditingFinished: {
+            if (acceptableInput && text.trim().length > 0)
+                backend.setRadarRangeMeters(Number(text), upperBound);
+            refresh();
+        }
+        ToolTip.visible: hovered
+        ToolTip.text: "Enter meters. Snaps to the nearest received sample, keeping at least one sample in the observation interval."
+    }
+
 	/** RX drawer: the reusable IQ capture settings (replaces the CSI pool drawer) **/
 	receiverDrawerComponent: Component {
 		IQ.IQRxDrawer {
@@ -165,63 +189,76 @@ Common.ESPARGOSApplication {
 
 
 
-			Label { text: "Radar Min Sample"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMinSampleControl
-				property string configKey: "delay_min"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: 0
-				to: Math.min(255, radarMaxSampleControl.value - 1) // Safe lower bound clustering limit
-				value: 0
-				stepSize: 1
-				editable: true
-				ToolTip.visible: hovered
-				ToolTip.text: "The lower cutoff slice index for the 2D Radar Map. This sample defines the center origin of the disk."
-			}
+            Label { text: "Range start [m]"; Layout.alignment: Qt.AlignRight }
+            RadarRangeField { objectName: "radarMinRangeField"; upperBound: false }
+            Label { text: "Range end [m]"; Layout.alignment: Qt.AlignRight }
+            RadarRangeField { objectName: "radarMaxRangeField"; upperBound: true }
+            Label {
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                text: isFinite(backend.radarZeroSample)
+                    ? "Resolution: " + backend.radarMetersPerSample.toFixed(3) + " m/sample · applied samples " + backend.delayMin + "–" + backend.delayMax
+                    : "Use Sync + Calibration to enter observation limits in meters."
+                color: "#9aa4b2"
+                font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
 
-			Label { text: "Radar Max Sample"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMaxSampleControl
-				property string configKey: "delay_max"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: Math.max(1, radarMinSampleControl.value + 1) // Force positive processing dimension
-				to: 256
-				value: 256
-				stepSize: 1
-				editable: true
-				ToolTip.visible: hovered
-				ToolTip.text: "The upper cutoff slice index for the 2D Radar Map. This sample defines the outer perimeter edge of the disk."
-			}
+            Label { text: "Radar color scale"; Layout.alignment: Qt.AlignRight }
+            ComboBox {
+                objectName: "radarScaleSelector"
+                property string configKey: "radar_scale"
+                property string configProp: "currentIndex"
+                function encode(index) { return index === 1 ? "linear" : "db"; }
+                function decode(value) { return value === "linear" ? 1 : 0; }
+                model: ["dB", "Linear power"]
+                Component.onCompleted: appDrawer.configManager.register(this)
+                onCurrentIndexChanged: appDrawer.configManager.onControlChanged(this)
+            }
 
-			Label { text: "Radar Power Min [dB]"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMinDbControl
-				property string configKey: "radar_min_db"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: -120
-				to: radarMaxDbControl.value - 1
-				value: -50
-				editable: true
-			}
-
-			Label { text: "Radar Power Max [dB]"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
-			SpinBox {
-				id: radarMaxDbControl
-				property string configKey: "radar_max_db"
-				property string configProp: "value"
-				Component.onCompleted: appDrawer.configManager.register(this)
-				onValueChanged: appDrawer.configManager.onControlChanged(this)
-				from: radarMinDbControl.value + 1
-				to: 20
-				value: 0
-				editable: true
-			}
+            Label { text: "Color limits [dBFS]"; Layout.alignment: Qt.AlignRight }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                RangeSlider {
+                    id: radarPowerLimits
+                    objectName: "radarPowerRangeSlider"
+                    property alias minimumValue: radarPowerLimits.first.value
+                    property alias maximumValue: radarPowerLimits.second.value
+                    Layout.fillWidth: true
+                    from: -120
+                    to: 20
+                    stepSize: 1
+                    snapMode: RangeSlider.SnapAlways
+                    first.value: -50
+                    second.value: 0
+                    first.onValueChanged: {
+                        if (first.value >= second.value) first.value = second.value - 1;
+                    }
+                    second.onValueChanged: {
+                        if (second.value <= first.value) second.value = first.value + 1;
+                    }
+                }
+                Label {
+                    text: "Min " + radarPowerLimits.first.value.toFixed(0) + "   ·   Max " + radarPowerLimits.second.value.toFixed(0)
+                    font.pixelSize: 11
+                    Layout.alignment: Qt.AlignHCenter
+                }
+                QtObject {
+                    property string configKey: "radar_min_db"
+                    property string configProp: "value"
+                    property alias value: radarPowerLimits.minimumValue
+                    Component.onCompleted: appDrawer.configManager.register(this)
+                    onValueChanged: appDrawer.configManager.onControlChanged(this)
+                }
+                QtObject {
+                    property string configKey: "radar_max_db"
+                    property string configProp: "value"
+                    property alias value: radarPowerLimits.maximumValue
+                    Component.onCompleted: appDrawer.configManager.register(this)
+                    onValueChanged: appDrawer.configManager.onControlChanged(this)
+                }
+            }
 
 
 
@@ -811,6 +848,7 @@ Common.ESPARGOSApplication {
 								height: gridOverlayCanvas.plotRadius
 								anchors.horizontalCenter: parent.horizontalCenter
 								anchors.bottom: parent.bottom
+                                anchors.bottomMargin: 28
 								onStatusChanged: if (status === ShaderEffect.Error) console.warn("Radar shader:", log)
 
 								property variant source: ShaderEffectSource {
@@ -831,20 +869,20 @@ Common.ESPARGOSApplication {
 						// Polar Vector Ring Overlay Grid (Layered correctly on top)
 						Canvas {
 							id: gridOverlayCanvas
+                            objectName: "radarGridOverlay"
 							anchors.fill: parent
 							z: 10
 
-							property real plotRadius: Math.max(0, Math.min((width - 180) / 2, height - 40))
+							property real plotRadius: Math.max(0, Math.min((width - 180) / 2, height - 68))
 							property var origin_x: 0.5 * gridOverlayCanvas.width
-							property var origin_y: gridOverlayCanvas.height // Match bottom edge baseline exactly
-							property var phi_num: 6
+							property var origin_y: gridOverlayCanvas.height - 28
+							property var phi_num: 18
 							property var text_color: "white"
 							property var text_width: 1
 							property var text_font: "14px sans-serif"
 
 							property var delay_min: backend.delayMin
 							property var delay_max: backend.delayMax
-							property var num_delay: 4
 
 							onPaint: {
 								var context = getContext("2d");
@@ -856,61 +894,77 @@ Common.ESPARGOSApplication {
 								context.lineWidth = text_width;
 
 								const radius = gridOverlayCanvas.plotRadius;
-								const totalSamples = delay_max - delay_min;
-
-								// 1. DYNAMIC GRID LINES AT EVERY 10 SAMPLES
-								// Determines sample interval spacing automatically based on current view range
-								let sampleStep = (totalSamples <= 64) ? 5 : 10; 
-								
-								// Calculate the starting sample index rounded to the nearest step
-								let startSample = Math.ceil(delay_min / sampleStep) * sampleStep;
-
-								for (let s = startSample; s <= delay_max; s += sampleStep) {
-									if (s <= delay_min) continue;
-
-									// Linear mapping: Translate sample index to pixel radius fraction
-									let fraction = (s - delay_min) / totalSamples;
-									let currentRadius = fraction * radius;
-
-									// Draw the concentric range arc
-									context.beginPath();
-									if (s % (sampleStep * 2) === 0) {
-										context.strokeStyle = "rgba(220, 230, 240, 0.45)"; // Main interval grid highlight
-										context.lineWidth = 1.5;
-									} else {
-										context.strokeStyle = "rgba(220, 230, 240, 0.32)"; // Sub-interval grid line
-										context.lineWidth = 1.0;
-									}
-									context.arc(origin_x, origin_y, currentRadius, Math.PI, 2 * Math.PI);
-									context.stroke();
-
-									// --- LABELS ON THE LOWER RIGHT SIDE ---
-									// Only label primary milestones to keep layout typography clean
-									if (s % (sampleStep * 2) === 0 || totalSamples <= 40) {
-										context.save();
-										context.fillStyle = "#8ecae6"; // Readable ice-blue telemetry contrast color
-										context.font = "11px monospace";
-										context.textAlign = "center";
-										context.textBaseline = "bottom";
-
-										// Place text horizontally from the middle towards the right edge
-										// Offset vertically by -4px so numbers sit cleanly on top of the axis line
-										context.fillText(s, origin_x + currentRadius, origin_y - 4);
-										context.restore();
-									}
-								}
+                                const totalSamples = delay_max - delay_min;
+                                const metersPerSample = backend.radarMetersPerSample;
+                                const zero = backend.radarZeroSample;
+                                if (radius <= 0) return;
+                                const rangeStart = (delay_min - zero) * metersPerSample;
+                                const rangeEnd = (delay_max - zero) * metersPerSample;
+                                const span = totalSamples * metersPerSample;
+                                // Rounded meter intervals adapt to zoom and available label space.
+                                const targetStep = span / Math.max(2, Math.floor(radius / 75));
+                                const magnitude = Math.pow(10, Math.floor(Math.log10(targetStep)));
+                                const normalized = targetStep / magnitude;
+                                const majorStep = (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) * magnitude;
+                                const decimals = Math.max(1, Math.ceil(-Math.log10(majorStep)));
+                                function label(text, x, y, color, baseline) {
+                                    context.save();
+                                    context.font = "12px monospace";
+                                    context.textAlign = "center";
+                                    context.textBaseline = baseline || "middle";
+                                    context.lineWidth = 3;
+                                    context.strokeStyle = "#101014";
+                                    context.strokeText(text, x, y);
+                                    context.fillStyle = color;
+                                    context.fillText(text, x, y);
+                                    context.restore();
+                                }
+                                function ring(fraction, major) {
+                                    context.beginPath();
+                                    context.lineWidth = major ? 1.3 : 0.65;
+                                    context.strokeStyle = major ? "rgba(225,235,245,0.60)" : "rgba(225,235,245,0.22)";
+                                    context.arc(origin_x, origin_y, fraction * radius, Math.PI, 2 * Math.PI);
+                                    context.stroke();
+                                }
+                                if (isFinite(zero)) {
+                                    const minorStep = majorStep / 5;
+                                    for (let tick = Math.ceil(rangeStart / minorStep); tick <= Math.floor(rangeEnd / minorStep); ++tick) {
+                                        const distance = tick * minorStep;
+                                        const fraction = (distance - rangeStart) / span;
+                                        if (fraction <= 0 || fraction >= 1) continue;
+                                        const major = tick % 5 === 0;
+                                        ring(fraction, major);
+                                        if (major) {
+                                            const r = fraction * radius;
+                                            const text = distance.toFixed(decimals) + " m";
+                                            if (r > 65) label(text, origin_x + r * 0.707, origin_y - r * 0.707, "#bce7ff");
+                                            if (r > 70 && radius - r > 70) {
+                                                label(text, origin_x + r, origin_y + 8, "#bce7ff", "top");
+                                                label(text, origin_x - r, origin_y + 8, "#bce7ff", "top");
+                                            }
+                                        }
+                                    }
+                                    label(rangeStart.toFixed(decimals) + " m", origin_x, origin_y + 8, "#bce7ff", "top");
+                                    for (const side of [-1, 1])
+                                        label(rangeEnd.toFixed(decimals) + " m", origin_x + side * radius, origin_y + 8, "#bce7ff", "top");
+                                } else {
+                                    for (let i = 1; i < 20; ++i) ring(i / 20, i % 5 === 0);
+                                }
+                                ring(1, true);
 
 								// 2. Draw Angular/Azimuth Spoke Lines
 								for (let i = -phi_num / 2; i <= phi_num / 2; i++) {
 									const radians = (i / phi_num) * Math.PI;
 									context.beginPath();
-									context.strokeStyle = "rgba(220, 230, 240, 0.35)";
-									context.lineWidth = 1.0;
+									const majorAngle = i % 3 === 0;
+                                    context.strokeStyle = majorAngle ? "rgba(225,235,245,0.55)" : "rgba(225,235,245,0.22)";
+                                    context.lineWidth = majorAngle ? 1.2 : 0.65;
 									context.moveTo(origin_x, origin_y);
 									context.lineTo(origin_x + Math.sin(radians) * radius, origin_y - Math.cos(radians) * radius);
 									context.stroke();
 
-									let angleText = (180 / phi_num * (-i)) + "°";
+									if (i % 3 !== 0) continue;
+                                    let angleText = (180 / phi_num * (-i)) + "°";
 									context.fillStyle = text_color;
 
 									if (i < 0) {
@@ -923,7 +977,10 @@ Common.ESPARGOSApplication {
 										context.textAlign = "left";
 										context.textBaseline = "bottom";
 									}
-									context.fillText(angleText, origin_x + Math.sin(radians) * (radius + 5), origin_y - Math.cos(radians) * (radius + 5));
+									context.strokeStyle = "#101014";
+                                    context.lineWidth = 3;
+                                    context.strokeText(angleText, origin_x + Math.sin(radians) * (radius + 8), origin_y - Math.cos(radians) * (radius + 8));
+                                    context.fillText(angleText, origin_x + Math.sin(radians) * (radius + 8), origin_y - Math.cos(radians) * (radius + 8));
 								}
 							}
 
@@ -943,7 +1000,7 @@ Common.ESPARGOSApplication {
 
 							Label {
 								Layout.alignment: Qt.AlignHCenter
-								text: "Received power\n(dBFS)"
+								text: backend.radarLinearScale ? "Received power\n(full scale²)" : "Received power\n(dBFS)"
 								color: "#d7dde5"
 								font.pixelSize: 10
 								horizontalAlignment: Text.AlignHCenter
@@ -975,7 +1032,7 @@ Common.ESPARGOSApplication {
 									anchors.top: parent.top
 									anchors.left: radarColorbarGradient.right
 									anchors.leftMargin: 5
-									text: backend.radarMaxDb.toFixed(0)
+									text: { backend.radarLinearScale; backend.radarMinDb; backend.radarMaxDb; return backend.radarColorbarLabel(1); }
 									color: "#ffffff"
 									font.pixelSize: 10
 								}
@@ -983,7 +1040,7 @@ Common.ESPARGOSApplication {
 									anchors.bottom: parent.bottom
 									anchors.left: radarColorbarGradient.right
 									anchors.leftMargin: 5
-									text: backend.radarMinDb.toFixed(0)
+									text: { backend.radarLinearScale; backend.radarMinDb; backend.radarMaxDb; return backend.radarColorbarLabel(0); }
 									color: "#ffffff"
 									font.pixelSize: 10
 								}
@@ -995,7 +1052,7 @@ Common.ESPARGOSApplication {
 										anchors.left: radarColorbarGradient.right
 										anchors.leftMargin: 5
 										y: parent.height * (index + 1) / 4 - height / 2
-										text: (backend.radarMaxDb - (index + 1) * (backend.radarMaxDb - backend.radarMinDb) / 4).toFixed(0)
+										text: { backend.radarLinearScale; backend.radarMinDb; backend.radarMaxDb; return backend.radarColorbarLabel(1 - (index + 1) / 4); }
 										color: "#ffffff"
 										font.pixelSize: 10
 									}
@@ -1010,7 +1067,7 @@ Common.ESPARGOSApplication {
 						id: radarStatusLabel
 						Layout.alignment: Qt.AlignHCenter
 						Layout.fillWidth: true
-						text: backend.radarStatus
+						text: backend.radarStatus + (isFinite(backend.radarZeroSample) ? " · zero: " + backend.radarZeroSample.toFixed(2) + " samples" : " · Use Sync + Calibration for range in meters")
 						color: backend.txActive ? "#9fd18b" : "#d8a657"
 						font.pixelSize: 15
 						font.bold: true
@@ -1023,7 +1080,8 @@ Common.ESPARGOSApplication {
 					target: backend
 					ignoreUnknownSignals: true
 
-					function onRadarConfigChanged() {
+					function onTxStateChanged() { gridOverlayCanvas.requestPaint(); }
+                    function onRadarConfigChanged() {
 						gridOverlayCanvas.requestPaint();
 						Qt.callLater(function() { plotCanvas.createImageData(); });
 					}
@@ -1067,4 +1125,4 @@ Common.ESPARGOSApplication {
 }
 
 }
-	
+

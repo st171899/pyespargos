@@ -10,6 +10,14 @@ import numpy as np
 from .calibration import Antenna, Calibration
 
 
+class TxRxDelayMeasurementError(ValueError):
+    """A timing probe failed its signal-quality or stability checks."""
+
+    def __init__(self, message, *, reason):
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class TxRxDelayCalibration:
     """Per-transmitter hardware delay relative to one coherent receiver group.

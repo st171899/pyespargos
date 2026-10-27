@@ -426,6 +426,12 @@ Use one RX calibration group and one TX calibration group at the same
 frequency, with prepared TX buffers and valid calibration. Sensors within
 each group share a phase reference. Timing probes temporarily use 80 MSa/s
 reception, then restore the selected RX rate and application waveforms.
+Probe RX gain defaults to 24 dB. For weak sensor-to-sensor coupling through a
+splitter, increase the temporary measurement gain, for example
+``pool.calibrate_tx_rx_delay(rx_gain=42)``. Application RX gains are restored
+after measurement. Signal quality, clipping, and independent-capture timing
+checks still apply.
+
 The TX replay length stays unchanged. For buffers longer than 1024 samples,
 the probe repeats every 1024 samples. The reference path must be shorter than
 this probe period to avoid ambiguous delays. Changing the TX replay length

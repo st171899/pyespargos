@@ -29,7 +29,7 @@ from espargos._iq_calibration.reciprocity_fit import DisconnectedLinks
 from espargos.iq_tx_control import CalibrationMeasurementError
 from demos.custom.common.iq_application import ESPARGOSIQApplication
 from demos.custom.common.iq_waterfall import WaterfallImageProvider, power_db_row
-from radar_tx import RadarTransmitter, configure_receivers
+from radar_tx import RadarTransmitter, configure_receivers, calibrate_radar_timing
 from beamforming import AZIMUTH_DEG, ELEVATION_DEG, planar_power, horizontal_power
 from clutter import RollingClutter
 from radar_signal import chirp_reference, local_geometry, matched_filter_peaks
@@ -87,6 +87,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         "delay_max": 256,
         "radar_min_db": -50,
         "radar_max_db": 0,
+        "radar_scale": "db",
     }
 
     # --- ping TX config ---
@@ -113,6 +114,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         parser.add_argument("--tx-squint", action="store_true")
         parser.add_argument("--tx-calibration", choices=("monitor", "reciprocity"), default="reciprocity")
         parser.add_argument("--calibration-path", choices=("reference", "antenna_l", "antenna_r"), default="reference")
+        parser.add_argument("--timing-path", choices=("reference", "antenna_l", "antenna_r"), default="reference", help="TX/RX range-zero calibration path (reference network by default)")
         super().__init__(argv, argparse_parent=parser)
         self.radar_tx = None
         self._active_ping_config = None
@@ -122,12 +124,14 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._tx_calibrating = False
         self._calibrated_tx_setup = None
         self._tx_calibration_valid = False
+        self._radar_timing = None
         self._tx_status = "Select transmit sensors, then apply and start."
-        self._tx_settings = {key: getattr(self.args, key) for key in ("frequency_mhz", "tx_gain_a", "tx_gain_b", "tx_bandwidth", "tx_output", "tx_azimuth", "tx_elevation", "tx_squint", "tx_calibration", "calibration_path")}
+        self._tx_settings = {key: getattr(self.args, key) for key in ("frequency_mhz", "tx_gain_a", "tx_gain_b", "tx_bandwidth", "tx_output", "tx_azimuth", "tx_elevation", "tx_squint", "tx_calibration", "calibration_path", "timing_path")}
         self._tx_settings.update({key: self.get_initial_config("app", key) for key in self.PING_TX_DEFAULTS})
         self._tx_settings["tx_sensors"] = list(self.args.tx_sensors)
         self.txOperationDone.connect(self._finish_tx_operation)
         self.radarCalibrationDone.connect(self._finish_radar_calibration)
+        self.txStateChanged.connect(self.radarConfigChanged.emit)
 
         self.iqcontrol = None  # IQController QML adapter, created once the pool is up
         self.active_board = 0
@@ -225,7 +229,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if "apply_calibration" in newcfg:
             if self.iqcontrol is not None:
                 self.iqcontrol.set_apply_calibration(bool(newcfg["apply_calibration"]))
-        if any(key in newcfg for key in ("delay_min", "delay_max", "radar_min_db", "radar_max_db")):
+        if any(key in newcfg for key in ("delay_min", "delay_max", "radar_min_db", "radar_max_db", "radar_scale")):
             self.radarConfigChanged.emit()
 
     def _on_iq_calibration_changed(self):
@@ -456,7 +460,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         display_max_db = float(0 if configured_max is None else configured_max)
         if display_max_db <= display_min_db:
             display_max_db = display_min_db + 1.0
-        norm_map = np.clip((power_db - display_min_db) / (display_max_db - display_min_db), 0.0, 1.0)
+        if hasattr(self, "appconfig") and self.appconfig.get("radar_scale") == "linear":
+            lower, upper = 10 ** (display_min_db / 10), 10 ** (display_max_db / 10)
+            norm_map = np.clip((power_map / reference_power - lower) / (upper - lower), 0.0, 1.0)
+        else:
+            norm_map = np.clip((power_db - display_min_db) / (display_max_db - display_min_db), 0.0, 1.0)
 
         colormap = matplotlib.colormaps.get_cmap("viridis")
         color_data = colormap(np.transpose(norm_map))
@@ -761,7 +769,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # Method/path select the next measurement; editing them changes no
         # running hardware and cannot invalidate an existing measurement.
         keys = ("frequency_mhz", "tx_gain_a", "tx_gain_b", "tx_bandwidth", "tx_output")
-        return tuple(settings[k] for k in keys) + (tuple(sorted(settings["tx_sensors"])),)
+        return tuple(settings[k] for k in keys) + (tuple(sorted(settings["tx_sensors"])), settings.get("timing_path", "reference"))
 
     def _check_tx_settings_calibration(self):
         if self.iqcontrol is not None and self._tx_setup(self._tx_settings) != self._calibrated_tx_setup:
@@ -957,6 +965,52 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     def radarMaxDb(self):
         value = self.appconfig.get("radar_max_db")
         return 0.0 if value is None else float(value)
+
+    @PyQt6.QtCore.pyqtProperty(bool, notify=radarConfigChanged)
+    def radarLinearScale(self):
+        return self.appconfig.get("radar_scale") == "linear"
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def radarMetersPerSample(self):
+        # Equivalent monostatic range: propagation traverses the path twice.
+        return espargos.constants.SPEED_OF_LIGHT / (2 * self._spectrum_sample_rate_hz)
+
+    @PyQt6.QtCore.pyqtSlot(float, bool, result=bool)
+    def setRadarRangeMeters(self, meters, upper):
+        """Snap a physical range cutoff to the nearest valid RX sample."""
+        zero = self.radarZeroSample
+        if not np.isfinite(meters) or not np.isfinite(zero):
+            return False
+        sample = int(np.floor(meters / self.radarMetersPerSample + zero + 0.5))
+        lower_sample, upper_sample = self._radar_delay_bounds()
+        if upper:
+            sample = max(lower_sample + 1, min(CHUNK_SAMPLES, sample))
+        else:
+            sample = max(0, min(upper_sample - 1, sample))
+        self.appconfig.set({"delay_max" if upper else "delay_min": sample})
+        self.radarConfigChanged.emit()
+        return True
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def radarZeroSample(self):
+        timing = self._radar_timing
+        if timing is None or not self._tx_calibration_valid or (self.iqcontrol is not None and self.iqcontrol.syncNeeded):
+            return float("nan")
+        # TX probes bypass TX delay correction. Include the correction applied
+        # to the restored waveform, then average circularly across replay wrap.
+        corrections = {c.state.antenna: c.delay_s for g in timing.calibration.select(direction="tx").groups for c in g.corrections}
+        delays = [delay + corrections[a] for a, delay in timing.delays_s.items()]
+        period = CHUNK_SAMPLES / 80e6
+        phase = np.mean(np.exp(2j * np.pi * np.asarray(delays) / period))
+        return float((np.angle(phase) % (2 * np.pi)) * period / (2 * np.pi) * self._spectrum_sample_rate_hz)
+
+    @PyQt6.QtCore.pyqtSlot(float, result=str)
+    def radarColorbarLabel(self, fraction):
+        lower, upper = self.radarMinDb, self.radarMaxDb
+        if self.radarLinearScale:
+            value = 10 ** (lower / 10) + fraction * (10 ** (upper / 10) - 10 ** (lower / 10))
+            return f"{value:.2g}"
+        return f"{lower + fraction * (upper - lower):.0f}"
 
         # Ensure this property setup section explicitly matches the demo footprint
 
@@ -1197,8 +1251,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             receivers = cfg.get("receivers", [])
             center_hz = float(receivers[0].get("rf_freq_hz", 2437e6)) if receivers else 2437e6
             with self._sample_window_lock:
+                rate_changed = self._spectrum_sample_rate_hz != sample_rate_hz
                 self._spectrum_sample_rate_hz = sample_rate_hz
                 self._spectrum_center_hz = center_hz
+            if rate_changed:
+                self.radarConfigChanged.emit()
         except Exception as e:
             print(f"spectrum config refresh error: {e}", file=sys.stderr)
 
@@ -1265,8 +1322,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 rate = cluster.sample_rate_hz[present][0]
                 center = cluster.center_freq_hz[present][0]
             with self._sample_window_lock:
+                rate_changed = self._spectrum_sample_rate_hz != float(rate)
                 self._spectrum_sample_rate_hz = float(rate)
                 self._spectrum_center_hz = float(center)
+            if rate_changed:
+                self.radarConfigChanged.emit()
 
             if isinstance(cluster, IQAccumCluster):
                 completion = cluster.section_completion
@@ -1486,6 +1546,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         settings = self._tx_settings.copy()
         resume = self.txActive
         stage = "validating requested setup"
+        self._radar_timing = None
         try:
             cfg = {key: settings[key] for key in self.PING_TX_DEFAULTS}
             waveform = self._build_ping_waveform(cfg)
@@ -1495,6 +1556,13 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             for attempt in range(3):
                 stage = "applying TX/RX roles and RF settings"
                 candidate.configure()
+                if attempt == 0:
+                    # Sync measures the whole demo pool afresh. Retire both
+                    # directions: a previous coherent RX group may include
+                    # sensors that now transmit (or the reverse).
+                    with self.pool._lock:
+                        self.pool.calibrations = self.pool.calibrations.without(self.pool.antennas)
+                        self.pool.iq._calibration = None
                 stage = "preparing the user waveform"
                 reference = candidate.prepare(waveform, cfg["tx_gain_db"]) if candidate.antennas else None
                 if candidate.antennas:
@@ -1511,16 +1579,20 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     # reciprocal link. Acquire a fresh, independently checked
                     # fit rather than publishing incomplete corrections.
                     self.logger.info("Retrying calibration with fresh independent pilot captures")
+            if reference is not None:
+                stage = "measuring zero-range TX/RX delay through " + settings["timing_path"]
+                self._radar_timing = calibrate_radar_timing(self.pool, candidate.antennas, settings["timing_path"], self.logger)
             resume = resume and not getattr(self, "_shutting_down", False)
             if resume and reference is not None:
                 candidate.session.mute(False)
             self._calibrated_tx_setup = self._tx_setup(settings)
             self._tx_calibration_valid = True
             if reference is not None:
-                self.logger.info("TX/RX array calibration complete; correlation indices use RX-window zero. " "Absolute TX-to-RX range zero is not measured.")
+                self.logger.info("TX/RX array and zero-range timing calibration complete")
             self.radarCalibrationDone.emit((reference, cfg, resume, None))
         except Exception as error:
-            error.add_note(f"Radar calibration stage: {stage}; selected TX={settings['tx_sensors']}; " f"RF={settings['frequency_mhz']} MHz; method={settings['tx_calibration']}; " f"path={settings['calibration_path']}")
+            self._radar_timing = None
+            error.add_note(f"Radar calibration stage: {stage}; selected TX={settings['tx_sensors']}; " f"RF={settings['frequency_mhz']} MHz; method={settings['tx_calibration']}; " f"array path={settings['calibration_path']}; timing path={settings.get('timing_path')}")
             self._calibrated_tx_setup = None
             self._tx_calibration_valid = False
             try:
@@ -1545,6 +1617,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             )
         )
         self.txStateChanged.emit()
+        self.radarConfigChanged.emit()
 
     def _start_iq_gui(self):
         """After the framework pool is up: expose the pool's QML adapter,
@@ -1552,6 +1625,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         hosts = ", ".join(b.host for b in self.receiver.boards)
         self.logger.info(f"IQ capture starting ({len(self.receiver.boards)} board(s): {hosts})")
         self.iqcontrol = self.create_iq_controller(sync_operation=self._synchronize_radar, config_operation=lambda config: configure_receivers(self.pool, config))
+        self.iqcontrol.syncNeededChanged.connect(self.radarConfigChanged.emit)
         self.iqcontrol.calibration_guard = lambda: (self._tx_calibration_valid and self._tx_setup(self._tx_settings) == self._calibrated_tx_setup)
         self.iqcontrol.calibrationChanged.connect(self._on_iq_calibration_changed)
         self.iqcontrol.referenceBusyChanged.connect(self.txStateChanged.emit)

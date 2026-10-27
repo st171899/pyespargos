@@ -282,10 +282,46 @@ calibration use the YAML reference-cable lengths. Calibration acquisition chunks
 are excluded from the displays, and incomplete captures are checked against the
 epochs of the receive sensors actually present.
 
-Delay bins identify pulse starts at 12.5 ns per sample. Absolute range requires
-a timing/path-delay reference; a shared clock alone does not establish the
-zero-range bin. Clutter removal can be calibrated after TX and RX settings
-settle.
+Sync + Calibration measures zero-range timing **through Reference** by default,
+using the same `pool.calibrate_tx_rx_delay()` probes as the MIMO radar demo.
+The timing measurement subtracts modeled cable and board-trace propagation
+delays, using the YAML cable lengths and velocity factors. It restores the
+prepared chirps, replay length, RX gain, capture settings, and RF routing.
+
+Timing starts at 24 dB RX gain. A weak or inconsistent timing probe is retried
+at 42 dB to handle low-level coupling across splitter output ports, especially
+when every receiver is on a separate board from every transmitter. Both the
+peak-quality threshold and the independent-capture consistency check still
+apply; clipped captures and unrelated configuration errors are not retried.
+A failed higher-gain measurement leaves TX muted and reports the error.
+
+The timing path can be selected independently of array phase calibration in
+Transmission settings or with `--timing-path`. Optional `antenna_r`/`antenna_l`
+timing treats direct-path propagation as negligible and requires no board
+positions or distances. Its measured zero includes the actual direct-path delay,
+shifting equivalent monostatic range by half the TX-to-RX path length.
+The heatmap subtracts the
+measured zero-distance sample when labeling range below the disk, using the
+current RX sample rate and `c / (2 * sample_rate)` meters per sample. This is
+equivalent monostatic range (half the TX-to-target-to-RX path length). Multiple
+transmitters use a circular mean of their delays, including TX calibration
+corrections, over the 256-sample TX replay. Range remains ambiguous by the pulse
+repetition period. Labels before the measured zero can be negative; no absolute
+meter labels are shown until timing calibration is valid.
+
+The radar observation start/end fields accept meters after timing calibration.
+Each entry snaps to the nearest RX sample and displays the applied meter value;
+cutoffs are clamped to the captured chunk with at least one sample between them.
+The selected interval stretches to fill the disk, preserving observation-area
+zoom. The grid uses adaptive major range rings, five subdivisions per major
+interval, and azimuth spokes every 10 degrees. Outlined labels show major ranges
+inside and below the disk and angles every 30 degrees.
+
+A shared color-limit slider has separate minimum and maximum handles in dBFS
+for both color scales. Select **dB** for logarithmic
+power mapping or **Linear power** for linear mapping; the colorbar shows the
+corresponding units (dBFS or power relative to full scale squared). Clutter
+removal can be calibrated after TX and RX settings settle.
 
 ## Clutter removal
 

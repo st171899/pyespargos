@@ -22,9 +22,124 @@ Analyzer = module.EspargosPulseRadarAnalyzer
 
 
 class RadarTXTest(unittest.TestCase):
+    def test_reference_timing_retries_weak_or_unstable_probes_at_higher_gain(self):
+        from radar_tx import calibrate_radar_timing
+        from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
+
+        for reason in ("weak", "unstable"):
+            pool, logger = Mock(), Mock()
+            expected = object()
+            pool.calibrate_tx_rx_delay.side_effect = [TxRxDelayMeasurementError("weak timing", reason=reason), expected]
+            self.assertIs(calibrate_radar_timing(pool, [], "reference", logger), expected)
+            self.assertEqual(pool.calibrate_tx_rx_delay.call_args_list, [unittest.mock.call(path="reference", rx_gain=24), unittest.mock.call(path="reference", rx_gain=42)])
+            logger.info.assert_called_once()
+
+    def test_timing_gain_recovery_preserves_quality_and_clipping_failures(self):
+        from radar_tx import calibrate_radar_timing
+        from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
+
+        pool = Mock()
+        pool.calibrate_tx_rx_delay.side_effect = TxRxDelayMeasurementError("still weak", reason="weak")
+        with self.assertRaises(TxRxDelayMeasurementError):
+            calibrate_radar_timing(pool, [], "reference", Mock())
+        self.assertEqual(pool.calibrate_tx_rx_delay.call_count, 2)
+        for error in (TxRxDelayMeasurementError("clipped", reason="clipped"), ValueError("invalid calibration group")):
+            pool = Mock()
+            pool.calibrate_tx_rx_delay.side_effect = error
+            with self.assertRaises(type(error)):
+                calibrate_radar_timing(pool, [], "reference", Mock())
+            pool.calibrate_tx_rx_delay.assert_called_once_with(path="reference", rx_gain=24)
+
+    def test_optional_antenna_timing_still_uses_zero_propagation(self):
+        from radar_tx import calibrate_radar_timing
+
+        pool = Mock(antennas=["tx", "rx"])
+        calibrate_radar_timing(pool, ["tx"], "antenna_r", Mock())
+        pool.calibrate_tx_rx_delay.assert_called_once_with(path="antenna_r", reference_delays_s={("tx", "rx"): 0.0}, rx_gain=24)
+
+    def test_air_timing_needs_no_positions_or_distances(self):
+        from radar_tx import air_path_delays
+
+        self.assertEqual(air_path_delays(["tx0", "tx1"], ["rx0", "rx1"]), {(t, r): 0.0 for t in ("tx0", "tx1") for r in ("rx0", "rx1")})
+
+    def test_meter_cutoffs_snap_to_samples_and_preserve_a_valid_interval(self):
+        for rate in (80e6, 20e6):
+            config = dict(delay_min=0, delay_max=256)
+            backend = SimpleNamespace(
+                radarZeroSample=10.25, radarMetersPerSample=299792458 / (2 * rate),
+                _radar_delay_bounds=lambda: (config["delay_min"], config["delay_max"]),
+                appconfig=SimpleNamespace(set=config.update), radarConfigChanged=Mock(),
+            )
+            def enter(sample, upper):
+                meters = (sample - backend.radarZeroSample) * backend.radarMetersPerSample
+                self.assertTrue(Analyzer.setRadarRangeMeters(backend, meters, upper))
+
+            enter(20.4, False)
+            enter(90.6, True)
+            self.assertEqual(config, dict(delay_min=20, delay_max=91))
+            enter(200, False)
+            self.assertEqual(config["delay_min"], 90)
+            enter(-100, True)
+            self.assertEqual(config["delay_max"], 91)
+            enter(-100, False)
+            enter(300, True)
+            self.assertEqual(config, dict(delay_min=0, delay_max=256))
+            self.assertFalse(Analyzer.setRadarRangeMeters(backend, float("nan"), False))
+            backend.radarZeroSample = float("nan")
+            self.assertFalse(Analyzer.setRadarRangeMeters(backend, 10, True))
+            self.assertEqual(config, dict(delay_min=0, delay_max=256))
+
+    def test_range_zero_includes_tx_correction_and_receive_rate(self):
+        # Two transmitters straddle replay wrap before their TX corrections.
+        corrections = [SimpleNamespace(state=SimpleNamespace(antenna=a), delay_s=d / 80e6) for a, d in ((0, 12), (1, -8))]
+        timing = SimpleNamespace(delays_s={0: 254 / 80e6, 1: 18 / 80e6}, calibration=SimpleNamespace(select=lambda **kw: SimpleNamespace(groups=[SimpleNamespace(corrections=corrections)])))
+        backend = SimpleNamespace(_radar_timing=timing, _tx_calibration_valid=True, iqcontrol=SimpleNamespace(syncNeeded=False), _spectrum_sample_rate_hz=80e6)
+        self.assertAlmostEqual(Analyzer.radarZeroSample.fget(backend), 10)
+        backend._spectrum_sample_rate_hz = 20e6
+        self.assertAlmostEqual(Analyzer.radarZeroSample.fget(backend), 2.5)
+        self.assertAlmostEqual(Analyzer.radarMetersPerSample.fget(backend), 299792458 / 40e6)
+        backend.iqcontrol.syncNeeded = True
+        self.assertTrue(np.isnan(Analyzer.radarZeroSample.fget(backend)))
+        backend.iqcontrol.syncNeeded = False
+        backend._tx_calibration_valid = False
+        self.assertTrue(np.isnan(Analyzer.radarZeroSample.fget(backend)))
+
+    def test_colorbar_ticks_follow_selected_normalization(self):
+        backend = SimpleNamespace(radarMinDb=-20, radarMaxDb=0, radarLinearScale=False)
+        self.assertEqual(Analyzer.radarColorbarLabel(backend, 0.5), "-10")
+        backend.radarLinearScale = True
+        self.assertEqual(Analyzer.radarColorbarLabel(backend, 0), "0.01")
+        self.assertEqual(Analyzer.radarColorbarLabel(backend, 0.5), "0.51")
+        self.assertEqual(Analyzer.radarColorbarLabel(backend, 1), "1")
+
+    def test_heatmap_color_scale_and_observation_crop(self):
+        samples = np.ones((8, 256), np.complex64)
+        config = dict(delay_min=8, delay_max=24, radar_min_db=-20, radar_max_db=0)
+        backend = SimpleNamespace(
+            _tx_waveform=None, _reference_ping_config=lambda: dict(pings_per_256=2),
+            _angle_corrected_traces=lambda traces: (samples, True),
+            _angle_geometry=lambda: np.arange(8).reshape(2, 4),
+            appconfig=SimpleNamespace(get=config.get), _radar_angle_size=256, _radar_delay_size=256,
+            radarConfigChanged=Mock(), radarStatusChanged=Mock(), radarMapChanged=Mock(),
+        )
+        # A return at -10 dBFS is halfway up the dB scale but about 9% up
+        # the linear scale, with identical manual -20..0 dBFS endpoints.
+        power = np.full((256, 16), 0.1 * 32 * module.ADC_FULL_SCALE**2)
+        for scale, expected in (("db", 0.5), ("linear", 0.09 / 0.99)):
+            config["radar_scale"] = scale
+            with patch.object(module, "horizontal_power", return_value=power) as beamform:
+                Analyzer._render_radar_heatmap(backend, {0: samples[0]})
+            self.assertEqual(beamform.call_args.args[0].shape, (2, 4, 16))
+            self.assertEqual(backend._radar_delay_size, 16)
+            rgba = np.asarray(backend.radarMapChanged.emit.call_args.args[0]).reshape(16, 256, 4)
+            expected_color = (np.asarray(module.matplotlib.colormaps["viridis"](expected)) * 255).astype(np.uint8)
+            np.testing.assert_array_equal(rgba[0, 0], expected_color)
+
     def setup_tx(self, sensors):
-        args = SimpleNamespace(tx_sensors=sensors, frequency_mhz=2380, tx_gain_a=0, tx_gain_b=0, tx_bandwidth=40, tx_output="antenna_r", tx_azimuth=25, tx_elevation=10, tx_squint=True, tx_calibration="reciprocity", calibration_path="reference")
+        args = SimpleNamespace(tx_sensors=sensors, frequency_mhz=2380, tx_gain_a=0, tx_gain_b=0, tx_bandwidth=40, tx_output="antenna_r", tx_azimuth=25, tx_elevation=10, tx_squint=True, tx_calibration="reciprocity", calibration_path="reference", timing_path="reference")
         pool = Mock(names=["espargosrx", "espargostx"], hosts=["10.42.0.35", "10.42.0.119"])
+        pool._lock = nullcontext()
+        pool.antennas = tuple(module.espargos.Antenna(host, a) for host in pool.hosts for a in range(8))
         pool.tx.authorization = [True, True]
         pool.tx.update.side_effect = lambda **kw: nullcontext()
         pool.boards = [Mock(), Mock()]
@@ -37,6 +152,7 @@ class RadarTXTest(unittest.TestCase):
     def test_receive_drawer_preserves_tx_on_mixed_and_tx_only_boards(self):
         tx, pool = self.setup_tx(["espargostx", "espargosrx.3"])
         pool._lock = nullcontext()
+        pool.antennas = tuple(module.espargos.Antenna(host, a) for host in pool.hosts for a in range(8))
         pool.boards[0].host, pool.boards[1].host = pool.hosts
         pool.boards[0].iq.get_config.return_value["modes"][3] = "iq_tx"
         pool.boards[1].iq.get_config.return_value["modes"] = ["iq_tx"] * 8
@@ -163,9 +279,19 @@ class RadarTXTest(unittest.TestCase):
         self.assertEqual(backend.block_acc, {})
 
     def test_central_button_calibrates_selected_tx_and_rx_while_stopped(self):
+        from espargos.calibration import Antenna, AntennaCorrection, Calibration, CalibrationGroup, CalibrationState
+
         tx, pool = self.setup_tx(["espargostx"])
         settings = dict(vars(tx.args), chirp_frames=16, bandwidth_hz=40e6, pings_per_256=2, tx_gain_db=-20)
         for active in (False, True):
+            pool.antennas = tuple(Antenna(host, a) for host in pool.hosts for a in range(8))
+            # An earlier all-RX fit spans both boards; the second board is
+            # now TX. Replacing only the current RX keys used to fail here.
+            pool.calibrations = Calibration((CalibrationGroup(tuple(AntennaCorrection(CalibrationState(a, "rx", 2400e6, 80e6, 1, 100), 0, 0) for a in pool.antennas)),))
+            keys = [(a, "rx" if a.host == pool.hosts[0] else "tx", 2400e6) for a in pool.antennas]
+            with self.assertRaisesRegex(ValueError, "complete calibration group"):
+                pool.calibrations._check_replacement(keys)
+            pool.calibrate.side_effect = lambda **kw: pool.calibrations._check_replacement(keys)
             backend = SimpleNamespace(
                 txActive=active,
                 pool=pool,
@@ -177,10 +303,14 @@ class RadarTXTest(unittest.TestCase):
                 radarCalibrationDone=Mock(),
                 logger=Mock(),
             )
-            candidate = Mock(antennas=["tx"])
+            candidate = Mock(antennas=tx.antennas)
             with patch.object(module, "RadarTransmitter", return_value=candidate):
                 Analyzer._synchronize_radar(backend)
             pool.calibrate.assert_called_with(tx_method="reciprocity", path="reference", per_board=False)
+            pool.calibrate_tx_rx_delay.assert_called_with(path="reference", rx_gain=24)
+            self.assertIs(backend._radar_timing, pool.calibrate_tx_rx_delay.return_value)
+            self.assertEqual(pool.calibrations.groups, ())
+            self.assertIsNone(pool.iq._calibration)
             candidate.prepare.assert_called_once()
             candidate.start.assert_not_called()
             candidate.prepare_calibration_helpers.assert_called_once()
@@ -213,7 +343,7 @@ class RadarTXTest(unittest.TestCase):
             logger=Mock(),
         )
         pool.calibrate.side_effect = [module.CalibrationMeasurementError("Independent validation failed"), None]
-        candidate = Mock(antennas=["tx"])
+        candidate = Mock(antennas=tx.antennas)
         with patch.object(module, "RadarTransmitter", return_value=candidate):
             Analyzer._synchronize_radar(backend)
         self.assertEqual(candidate.prepare.call_count, 2)
@@ -234,7 +364,7 @@ class RadarTXTest(unittest.TestCase):
             logger=Mock(),
         )
         pool.calibrate.side_effect = module.DisconnectedLinks([[0], [1]])
-        with patch.object(module, "RadarTransmitter", return_value=Mock(antennas=["tx"])):
+        with patch.object(module, "RadarTransmitter", return_value=Mock(antennas=tx.antennas)):
             with self.assertRaises(module.DisconnectedLinks):
                 Analyzer._synchronize_radar(backend)
         self.assertIsNone(backend._calibrated_tx_setup)
@@ -299,7 +429,7 @@ class RadarTXTest(unittest.TestCase):
         for key, value in dict(chirp_frames=32, bandwidth_hz=20e6, pings_per_256=1, tx_gain_db=-30, tx_azimuth=0, tx_elevation=0, tx_squint=False, tx_calibration="monitor", calibration_path="antenna_l").items():
             with self.subTest(key=key):
                 self.assertEqual(Analyzer._tx_setup(dict(settings, **{key: value})), original)
-        for key, value in dict(frequency_mhz=2400, tx_gain_a=1, tx_gain_b=1, tx_bandwidth=20, tx_output="antenna_l", tx_sensors=["espargosrx.1"]).items():
+        for key, value in dict(frequency_mhz=2400, tx_gain_a=1, tx_gain_b=1, tx_bandwidth=20, tx_output="antenna_l", tx_sensors=["espargosrx.1"], timing_path="antenna_l").items():
             with self.subTest(key=key):
                 self.assertNotEqual(Analyzer._tx_setup(dict(settings, **{key: value})), original)
 

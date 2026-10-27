@@ -4,7 +4,7 @@ import numpy as np
 
 from ..calibration import Antenna
 from .capture import _Captures, _grid_origin
-from ..iq_tx_rx_delay import TxRxDelayCalibration
+from ..iq_tx_rx_delay import TxRxDelayCalibration, TxRxDelayMeasurementError
 from ..iq_tx_control import _rpc, _waveform
 from .pilots import pilots
 from ..sensor_calibration import compute_reference_path_delays
@@ -19,14 +19,14 @@ def _delay(response, sample_rate):
     power = np.mean(abs(impulse.reshape(-1, 16 * samples)) ** 2, axis=0)
     index = int(np.argmax(power))
     if not np.isfinite(power).all() or power[index] <= 0 or power[index] < 8 * np.median(power):
-        raise ValueError("No clear reference path for TX–RX timing")
+        raise TxRxDelayMeasurementError("No clear reference path for TX–RX timing", reason="weak")
     left, middle, right = power[(index - 1) % len(power)], power[index], power[(index + 1) % len(power)]
     curvature = left - 2 * middle + right
     fraction = 0.5 * (left - right) / curvature if curvature < 0 else 0
     return float((index + fraction) / (16 * sample_rate)) % (samples / sample_rate)
 
 
-def measure(owner, antennas, path, reference_delays_s, timeout):
+def measure(owner, antennas, path, reference_delays_s, timeout, rx_gain=24):
     """Measure with calibration probes, then restore the application waveforms."""
     routes = {"reference": 1, "antenna_r": 2, "antenna_l": 3}
     if path not in routes:
@@ -69,17 +69,23 @@ def measure(owner, antennas, path, reference_delays_s, timeout):
         raise ValueError("Timing probes require calibrated RX sample origins")
     capture = _Captures(boards)
     prepared = set()
+    configured_rx = set()
     measured = {}
     success = False
     try:
         for bi, b in enumerate(boards):
             _rpc(b, "set_iq_tx", {"muted": True, "steering": {"phase_deg": [0] * 8, "delay_samples": [0] * 8}})
-            decimation = 1 if any(a.host == b.host for a in rx) else configs[bi]["adc_decimation"]
+            receivers = [{"antid": a.antid, "rx_gain": rx_gain, "gain_mode": "manual"} for a in rx if a.host == b.host]
+            # TX-only boards need no capture changes. Firmware rejects an
+            # empty receiver update, and their replay timing must be preserved.
+            if not receivers:
+                continue
+            configured_rx.add(bi)
             b.iq.set_config(
                 {
-                    "adc_decimation": decimation,
+                    "adc_decimation": 1,
                     "rf_switch": routes[path],
-                    "receivers": [{"antid": a.antid, "rx_gain": 24, "gain_mode": "manual"} for a in rx if a.host == b.host],
+                    "receivers": receivers,
                     "trigger": {"mode": "interval", "interval_chunks": 8192, "burst_chunks": 4},
                 }
             )
@@ -113,17 +119,21 @@ def measure(owner, antennas, path, reference_delays_s, timeout):
                 shift_s = ((2 * int(delta) + 12) // 25) / 80e6
                 z = np.asarray([np.concatenate([p.decode_iq() for p in frame]) for frame in chunks])
                 if max(abs(z.real).max(), abs(z.imag).max()) >= 500:
-                    raise ValueError("Timing calibration clips the receiver")
+                    raise TxRxDelayMeasurementError("Timing calibration clips the receiver", reason="clipped")
                 h = np.zeros(z.shape, complex)
                 h[:, bins % period] = np.fft.fft(z, axis=-1)[:, bins % period] / spectrum[bins % period]
                 h *= correction.response(correction.state.frequency_hz + frequencies) * np.exp(-2j * np.pi * frequencies * shift_s)
                 h *= np.exp(2j * np.pi * frequencies * delays[transmitter, receiver])
                 responses.append(h)
             first, second = np.asarray(responses).reshape(len(rx), 2, 8, period).mean(axis=2).transpose(1, 0, 2)
-            delay, checked = _delay(first, 80e6), _delay(second, 80e6)
+            try:
+                delay, checked = _delay(first, 80e6), _delay(second, 80e6)
+            except TxRxDelayMeasurementError as error:
+                error.add_note(f"Timing transmitter {transmitter.host}/{transmitter.antid}; path={path}; RX gain={rx_gain} dB")
+                raise
             ambiguity = period / 80e6
             if abs((checked - delay + ambiguity / 2) % ambiguity - ambiguity / 2) > 1 / 80e6:
-                raise ValueError("TX–RX timing changed between reference captures")
+                raise TxRxDelayMeasurementError("TX–RX timing changed between reference captures", reason="unstable")
             measured[transmitter] = delay
             _rpc(b, "set_iq_tx", {"muted": True})
         final = [_rpc(b, "get_iq_tx") for b in boards]
@@ -149,7 +159,8 @@ def measure(owner, antennas, path, reference_delays_s, timeout):
                     attempt(_waveform, b, {"type": "restore", "samples": tx_states[bi]["sensors"][transmitter.antid]["samples"], "antennas": [transmitter.antid]}, timeout, wait=capture.wait)
             keys = ("antid", "output", "amplitude", "rf_gain")
             attempt(_rpc, b, "set_iq_tx", {"steering": tx_states[bi]["steering"], "transmitters": [{k: s[k] for k in keys} for s in tx_states[bi]["sensors"]]})
-            attempt(b.iq.set_config, {k: configs[bi][k] for k in ("rf_switch", "receivers", "trigger", "adc_decimation")})
+            if bi in configured_rx:
+                attempt(b.iq.set_config, {k: configs[bi][k] for k in ("rf_switch", "receivers", "trigger", "adc_decimation")})
         attempt(capture.close)
         if success and not errors:
             for b, state in zip(boards, tx_states):

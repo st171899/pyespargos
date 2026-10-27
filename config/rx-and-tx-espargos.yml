@@ -10,7 +10,7 @@ combined-array:
         length: 0.9
         velocity_factor: 0.76
     espargostx:
-      host: 10.42.0.119
+      host: 10.42.0.204
       cable:
         length: 2.8
         velocity_factor: 0.76        

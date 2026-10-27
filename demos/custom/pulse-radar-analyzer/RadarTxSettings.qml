@@ -133,7 +133,8 @@ ScrollView {
                     {key: "tx_output", label: "TX output", values: ["antenna_r", "antenna_l", "reference", "isolated"]},
                     {key: "pings_per_256", label: "Chirps per 256 samples", values: [1, 2, 4, 8, 16, 32, 64, 128, 256]},
                     {key: "tx_calibration", label: "TX calibration", values: ["reciprocity", "monitor"]},
-                    {key: "calibration_path", label: "Calibration path", values: ["reference", "antenna_l", "antenna_r"]}
+                    {key: "calibration_path", label: "Array calibration path", values: ["reference", "antenna_l", "antenna_r"]},
+                    {key: "timing_path", label: "Timing calibration path", values: ["reference", "antenna_r", "antenna_l"]}
                 ]
                 RowLayout {
                     id: choiceRow
@@ -147,6 +148,13 @@ ScrollView {
                         onActivated: backend.setTxSetting(choiceRow.modelData.key, choiceRow.modelData.values[currentIndex])
                     }
                 }
+            }
+            Label {
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                text: "Reference timing uses the configured cable delays, with automatic gain recovery for weak splitter coupling. Antenna timing is optional and neglects direct-path travel time."
+                wrapMode: Text.WordWrap
+                font.pixelSize: 12
             }
             Label { text: "Frequency-dependent steering (squint)" }
             Switch {
@@ -178,7 +186,7 @@ ScrollView {
         }
         }
         Label {
-            text: "Settings take effect with Apply and start TX or Sync + Calibration. Starting TX does not recalibrate. Changes to sensor roles or RF settings require Sync + Calibration to refresh corrections. Correlation indices use the RX window start; array calibration does not measure absolute range zero."
+            text: "Settings take effect with Apply and start TX or Sync + Calibration. Starting TX does not recalibrate. Sync measures array corrections, then zero-range timing through the selected timing path. Changes to sensor roles, RF settings, or timing settings require Sync + Calibration."
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
         }

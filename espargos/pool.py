@@ -206,7 +206,7 @@ class AntennaSelection:
                 owner.refresh_calibration()
         return self
 
-    def calibrate_tx_rx_delay(self, *, path="reference", reference_delays_s=None, timeout=5.0):
+    def calibrate_tx_rx_delay(self, *, path="reference", reference_delays_s=None, timeout=5.0, rx_gain=24):
         """Measure each IQ transmitter's delay relative to calibrated receivers.
 
         Temporarily receive calibration probes at 80 MSa/s, then restore the RX
@@ -215,15 +215,19 @@ class AntennaSelection:
         Reference-path delays come from board traces and configured cable lengths.
         For antenna paths, supply {(tx_antenna, rx_antenna): delay_seconds}.
         At least one calibrated IQ receiver and transmitter must be running.
+        ``rx_gain`` sets temporary probe gain in dB (0–76); application gain
+        is restored afterward. Increase it for weak sensor-to-sensor coupling.
         """
         from ._iq_calibration.delay import measure
 
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive and finite")
+        if isinstance(rx_gain, bool) or not isinstance(rx_gain, (int, float)) or not math.isfinite(rx_gain) or rx_gain != int(rx_gain) or not 0 <= rx_gain <= 76:
+            raise ValueError("rx_gain must be an integer from 0 to 76 dB")
         owner = self._pool
         with owner._lock:
             owner.open()
-            return measure(owner, self.antennas, path, reference_delays_s, timeout)
+            return measure(owner, self.antennas, path, reference_delays_s, timeout, rx_gain=int(rx_gain))
 
     def start_transmission(self, *, amplitude=1.0):
         """Unmute selected IQ transmitters, scaling their prepared waveforms.

@@ -10,6 +10,27 @@ from espargos._iq_calibration.reference import _map
 from espargos.iq_tx_control import _rpc, _waveform
 from espargos.steering import Beamspace
 from espargos.waveforms import IQSamples
+from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
+
+
+def air_path_delays(transmitters, receivers):
+    """Establish range zero from direct coupling, neglecting propagation time."""
+    return {(tx, rx): 0.0 for tx in transmitters for rx in receivers}
+
+
+def calibrate_radar_timing(pool, transmitters, path, logger):
+    """Use MIMO's timing probes, increasing gain for weak inter-board links."""
+    kwargs = {"path": path}
+    if path != "reference":
+        transmitters = set(transmitters)
+        kwargs["reference_delays_s"] = air_path_delays(transmitters, set(pool.antennas) - transmitters)
+    for gain in (24, 42):
+        try:
+            return pool.calibrate_tx_rx_delay(**kwargs, rx_gain=gain)
+        except TxRxDelayMeasurementError as error:
+            if gain == 42 or error.reason not in ("weak", "unstable"):
+                raise
+            logger.info("TX/RX timing probe was %s at %s dB RX gain; retrying at 42 dB", error.reason, gain)
 
 
 def configure_receivers(pool, config):
