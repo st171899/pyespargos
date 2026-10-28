@@ -61,12 +61,28 @@ Common.ESPARGOSApplication {
 	appDrawerComponent: Component {
 		Common.AppDrawer {
 			id: appDrawer
-			title: "Display"
+			title: "Radar settings"
+            implicitWidth: 600
+            objectName: "radarAppDrawer"
 			endpoint: appconfig
 			// Keep this addon's grid narrower than the drawer viewport. AppDrawer
 			// then has no horizontal overflow to scroll, without changing the
 			// shared component used by WiFi demos.
 			contentLayout.width: Math.max(0, appDrawer.width - 40)
+
+            TabBar {
+                id: settingsTabs
+                objectName: "radarSettingsTabs"
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                TabButton { text: "Display" }
+                TabButton { text: "Transmitter" }
+            }
+            GridLayout {
+                columns: 2
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                visible: settingsTabs.currentIndex === 0
 
 			Label { text: "Mode"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			ComboBox {
@@ -260,6 +276,13 @@ Common.ESPARGOSApplication {
                 }
             }
 
+            }
+            RadarTxSettings {
+                visible: settingsTabs.currentIndex === 1
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+            }
+
 
 
 		}
@@ -272,23 +295,11 @@ Common.ESPARGOSApplication {
 		anchors.margins: 10
 		spacing: 8
 
-        TabBar {
-            id: workspaceTabs
-            objectName: "workspaceTabs"
-            Layout.fillWidth: true
-            TabButton { text: "Receive" }
-            TabButton { text: "Transmission" }
-        }
-        RadarTxSettings {
-            visible: workspaceTabs.currentIndex === 1
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-        }
 		TabBar {
 			id: boardTabs
             objectName: "receiveBoardTabs"
             currentIndex: backend.activeBoard
-			visible: workspaceTabs.currentIndex === 0 && backend.boardCount > 1
+			visible: backend.boardCount > 1
 			Layout.fillWidth: true
 			z: 20
 			onCurrentIndexChanged: backend.set_active_board(currentIndex)
@@ -301,7 +312,6 @@ Common.ESPARGOSApplication {
 			}
 		}
 		StackLayout {
-            visible: workspaceTabs.currentIndex === 0
 			Layout.fillWidth: true
 			Layout.fillHeight: true
 			currentIndex: backend.radarMode ? 2 : (backend.angleMode ? 1 : 0)

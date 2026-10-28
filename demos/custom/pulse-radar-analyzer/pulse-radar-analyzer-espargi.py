@@ -2,6 +2,7 @@
 """Mixed ESPARGOS IQ TX/RX pulse radar. See README.md for sensor selection."""
 
 import argparse
+import copy
 import os
 import pathlib
 import sys
@@ -44,8 +45,8 @@ PHASE_MAPPER = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmi
 
 
 def receive_chirp_reference(waveform, config, sample_rate_hz=80e6):
-    """Sample the 80 MSa/s replay reference on the receive ADC grid."""
-    return chirp_reference(waveform, config, sample_rate_hz, 80e6)
+    """Band-limit and resample the TX source reference onto the RX grid."""
+    return chirp_reference(waveform, config, sample_rate_hz, config.get("fs_hz", 80e6), bandlimited=True)
 
 
 def pool_complex_to_width(z, w):
@@ -79,6 +80,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         "apply_calibration": True,
         "chirp_frames": 16,
         "bandwidth_hz": 40e6,
+        "fs_hz": 80e6,
         "pings_per_256": 2,
         "tx_gain_db": -20,
         "remove_los": False,
@@ -94,6 +96,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     PING_TX_DEFAULTS = {
         "chirp_frames": 16,
         "bandwidth_hz": 40e6,
+        "fs_hz": 80e6,
         "pings_per_256": 2,
         "tx_gain_db": -20,
     }
@@ -129,11 +132,22 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._tx_settings = {key: getattr(self.args, key) for key in ("frequency_mhz", "tx_gain_a", "tx_gain_b", "tx_bandwidth", "tx_output", "tx_azimuth", "tx_elevation", "tx_squint", "tx_calibration", "calibration_path", "timing_path")}
         self._tx_settings.update({key: self.get_initial_config("app", key) for key in self.PING_TX_DEFAULTS})
         self._tx_settings["tx_sensors"] = list(self.args.tx_sensors)
+        self._tx_settings.update(waveform_editor=False, samples=256)
+        self._live_tx_pending = False
+        self._live_tx_timer = PyQt6.QtCore.QTimer(self)
+        self._live_tx_timer.setSingleShot(True)
+        self._live_tx_timer.setInterval(45)
+        self._live_tx_timer.timeout.connect(self._apply_live_tx)
+        from radar_tx_controller import RadarTxController
+        from demos.custom.common.iq_tx_plot import IQTxPlot
+        from PyQt6.QtQml import qmlRegisterType
+        qmlRegisterType(IQTxPlot, "ESPARGOS.Tx", 1, 0, "IQTxPlot")
         self.txOperationDone.connect(self._finish_tx_operation)
         self.radarCalibrationDone.connect(self._finish_radar_calibration)
         self.txStateChanged.connect(self.radarConfigChanged.emit)
 
         self.iqcontrol = None  # IQController QML adapter, created once the pool is up
+        self.txcontrol = RadarTxController(self)
         self.active_board = 0
         # clusters delivered by the pool's processing worker, drained by the
         # render thread (bounded so a stalled render cannot grow it unboundedly)
@@ -239,7 +253,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._display_epoch = None
         with self._pending_lock:
             self._pending_clusters.clear()
-        self._angle_status = "IQ calibration complete. Angle estimate is updating."
+        if self.iqcontrol is not None and not self.iqcontrol.syncNeeded:
+            self._angle_status = "IQ calibration complete. Angle estimate is updating."
+        else:
+            self._angle_status = "IQ calibration is unavailable or no longer valid. Run Sync + Calibration."
         self.angleChanged.emit()
 
     def _set_display_mode(self, mode):
@@ -397,7 +414,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """Render available samples, using calibration and matched filtering when available."""
         config = self._reference_ping_config()
         pings_per_256 = max(1, min(config.get("pings_per_256", 2), CHUNK_SAMPLES))
-        burst_length = CHUNK_SAMPLES // pings_per_256
+        burst_length = CHUNK_SAMPLES if config.get("waveform_editor") else CHUNK_SAMPLES // pings_per_256
 
         corrected, calibration_ready = self._angle_corrected_traces(traces)
 
@@ -493,8 +510,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if sample_count is None:
             sample_count = CHUNK_SAMPLES
         if burst_length is None:
-            config = self._current_ping_config()
-            burst_length = CHUNK_SAMPLES // max(1, min(config.get("pings_per_256", 2), CHUNK_SAMPLES))
+            config = self._reference_ping_config()
+            burst_length = CHUNK_SAMPLES if config.get("waveform_editor") else CHUNK_SAMPLES // max(1, min(config.get("pings_per_256", 2), CHUNK_SAMPLES))
         appconfig = getattr(self, "appconfig", None)
         configured_min = appconfig.get("delay_min") if appconfig is not None else 0
         configured_max = appconfig.get("delay_max") if appconfig is not None else min(int(sample_count), CHUNK_SAMPLES)
@@ -618,6 +635,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         return {
             "chirp_frames": int(self._ping_config_value("chirp_frames", self.PING_TX_DEFAULTS["chirp_frames"])),
             "bandwidth_hz": float(self._ping_config_value("bandwidth_hz", self.PING_TX_DEFAULTS["bandwidth_hz"])),
+            "fs_hz": float(self._ping_config_value("fs_hz", self.PING_TX_DEFAULTS["fs_hz"])),
             "pings_per_256": int(self._ping_config_value("pings_per_256", self.PING_TX_DEFAULTS["pings_per_256"])),
             "tx_gain_db": float(self._ping_config_value("tx_gain_db", self.PING_TX_DEFAULTS["tx_gain_db"])),
         }
@@ -627,55 +645,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         Builds a high-precision, continuous complex reference template that
         precisely tracks the discrete bin boundaries used by the C hardware generator.
         """
-        cfg = self._current_ping_config() if config is None else config
-        chirp_frames = int(cfg["chirp_frames"])
-        bw_hz = float(cfg["bandwidth_hz"])
-        if not np.isfinite(bw_hz) or not 0 < bw_hz <= 80e6:
-            raise ValueError("Chirp bandwidth must be greater than 0 and at most 80 MHz")
-        pings_per_256 = int(cfg["pings_per_256"])
-
-        # Read dynamic sampling rate from the interface config
-        fs_hz = float(cfg.get("fs_hz", 80e6))
-
-        CHUNK_SAMPLES = 256
-        if pings_per_256 <= 0 or CHUNK_SAMPLES % pings_per_256:
-            raise ValueError("Chirps per 256 must divide 256 (1, 2, 4, 8, …, 256)")
-        burst_length = CHUNK_SAMPLES // pings_per_256
-        chirp_frames = max(1, min(chirp_frames, burst_length))
-
-        # 1. Replicate the C code's discrete bin conversion logic
-        f_bin_resolution = fs_hz / CHUNK_SAMPLES
-        s_start_bin = int(np.round((-bw_hz / 2.0) / f_bin_resolution))
-        s_stop_bin = int(np.round((bw_hz / 2.0) / f_bin_resolution))
-
-        # 2. Map those discrete bins back out to physical analog frequencies
-        # This step aligns your continuous template with the hardware's true output
-        f_start = s_start_bin * f_bin_resolution
-        f_end = s_stop_bin * f_bin_resolution
-
-        # 3. Generate high-precision continuous phase tracking arrays
-        t = np.arange(chirp_frames, dtype=np.float64) / fs_hz
-        chirp_duration = chirp_frames / fs_hz
-
-        # Calculate sweep rate using the updated discrete bounds
-        k = (f_end - f_start) / chirp_duration
-        phase = 2.0 * np.pi * (f_start * t + 0.5 * k * (t**2))
-
-        # 4. Continuous exponential synthesis
-        active_chirp = np.exp(1j * phase).astype(np.complex64)
-
-        # Pad tail silence to complete the burst window
-        zero_samples = max(0, burst_length - chirp_frames)
-        single_burst = np.concatenate((active_chirp, np.zeros(zero_samples, dtype=np.complex64)))
-
-        # Repeat block across the full buffer sequence
-        waveform_256 = np.tile(single_burst, pings_per_256)[:CHUNK_SAMPLES]
-
-        # Scale to the UI amplitude target configuration
-        amplitude_target = float(cfg.get("amplitude_target", 1.0))
-        waveform_scaled = waveform_256 * amplitude_target
-
-        return waveform_scaled
+        from radar_waveform import pulse_waveform
+        return pulse_waveform(self._current_ping_config() if config is None else config)
 
     def _matched_filter(self, iq):
         """Return chirp correlation and pulse starts in RX-window coordinates."""
@@ -705,6 +676,26 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         correlation = np.convolve(received, np.conj(reference[::-1]), mode="full")
         return correlation[reference.size - 1 : reference.size - 1 + received.size].astype(np.complex64)
 
+    @PyQt6.QtCore.pyqtProperty(PyQt6.QtCore.QObject, constant=True)
+    def txController(self):
+        return self.txcontrol
+
+    def _queue_live_tx(self):
+        if self.txActive or self._tx_busy:
+            self._live_tx_pending = True
+            self._live_tx_timer.start()
+        self.txStateChanged.emit()
+
+    def _apply_live_tx(self):
+        if not self._live_tx_pending or self._shutting_down:
+            return
+        if self.txBusy or self.txcontrol.data["busy"]:
+            self._live_tx_timer.start()
+            return
+        self._live_tx_pending = False
+        if self.txActive:
+            self._start_tx(live=True)
+
     @PyQt6.QtCore.pyqtProperty("QVariantMap", notify=txStateChanged)
     def txSettings(self):
         return self._tx_settings
@@ -727,25 +718,50 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtSlot(str, "QVariant")
     def setTxSetting(self, key, value):
-        if not self.txBusy and key in self._tx_settings and key != "tx_sensors":
+        if (not self.txBusy or self._tx_busy) and key in self._tx_settings and key != "tx_sensors":
             integer_keys = {"tx_gain_a", "tx_gain_b", "tx_bandwidth", "chirp_frames", "pings_per_256"}
             if key in integer_keys:
                 value = int(value)
+            if key == "fs_hz":
+                from radar_waveform import TX_SAMPLE_RATES, DAC_RATE_HZ
+                if value not in TX_SAMPLE_RATES:
+                    return
+                self._tx_settings["bandwidth_hz"] = min(self._tx_settings["bandwidth_hz"], value)
+                maximum = int(8192 * value / DAC_RATE_HZ)
+                self._tx_settings["samples"] = min(self._tx_settings["samples"], maximum)
+                self.txcontrol.data["samples"] = self._tx_settings["samples"]
+            if key == "bandwidth_hz":
+                value = min(float(value), self._tx_settings.get("fs_hz", 80e6))
+            if key in ("tx_gain_a", "tx_gain_b") and not self.txcontrol.data["unlocked"]:
+                value = min(2 if key == "tx_gain_a" else 0, max(0, value))
             self._tx_settings[key] = value
+            if key == "tx_gain_db":
+                for beam in self.txcontrol.data["beams"]:
+                    beam["amplitude"] = 10 ** (float(value)/20)
             if key == "tx_calibration" and value == "monitor":
                 self._tx_settings["calibration_path"] = "reference"
+            if key in ("tx_azimuth", "tx_elevation"):
+                az, el = np.radians([self._tx_settings["tx_azimuth"], self._tx_settings["tx_elevation"]])
+                self.steerTx(float(np.sin(az)*np.cos(el)), float(np.sin(el)))
+            if key == "tx_squint":
+                self.txcontrol.data["beams"][0]["squint"] = bool(value)
+                self._tx_settings["beams"] = copy.deepcopy(self.txcontrol.data["beams"][:self.txcontrol.data["count"]])
             self._check_tx_settings_calibration()
-            self.txStateChanged.emit()
+            self._queue_live_tx()
 
     @PyQt6.QtCore.pyqtSlot(float, float)
     def steerTx(self, u, v):
-        if self.txBusy or not np.isfinite([u, v]).all():
+        if (self.txBusy and not self._tx_busy) or not np.isfinite([u, v]).all():
             return
         norm = max(1.0, np.hypot(u, v))
         u, v = u / norm, v / norm
         self._tx_settings["tx_azimuth"] = float(np.degrees(np.arctan2(u, np.sqrt(max(0, 1 - u * u - v * v)))))
         self._tx_settings["tx_elevation"] = float(np.degrees(np.arcsin(v)))
-        self.txStateChanged.emit()
+        if hasattr(self, "txcontrol"):
+            az, el = np.radians([self._tx_settings["tx_azimuth"], self._tx_settings["tx_elevation"]])
+            self.txcontrol.data["beams"][0].update(u=float(np.sin(az)*np.cos(el)), v=float(np.sin(el)))
+            self._tx_settings["beams"] = copy.deepcopy(self.txcontrol.data["beams"][:self.txcontrol.data["count"]])
+        self._queue_live_tx()
 
     @PyQt6.QtCore.pyqtSlot(str, int, bool)
     def setTxSensor(self, board, antenna, selected):
@@ -769,7 +785,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # Method/path select the next measurement; editing them changes no
         # running hardware and cannot invalidate an existing measurement.
         keys = ("frequency_mhz", "tx_gain_a", "tx_gain_b", "tx_bandwidth", "tx_output")
-        return tuple(settings[k] for k in keys) + (tuple(sorted(settings["tx_sensors"])), settings.get("timing_path", "reference"))
+        return tuple(settings[k] for k in keys) + (tuple(sorted(settings["tx_sensors"])), settings.get("timing_path", "reference"), settings.get("fs_hz", 80e6), settings.get("samples", 256))
 
     def _check_tx_settings_calibration(self):
         if self.iqcontrol is not None and self._tx_setup(self._tx_settings) != self._calibrated_tx_setup:
@@ -777,23 +793,33 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtSlot()
     def startTx(self):
+        self._start_tx()
+
+    def _start_tx(self, live=False):
         if self._tx_busy or not self.ready:
             return
         if self.iqcontrol is None or self.iqcontrol.referenceBusy:
             self._tx_status = "Wait for IQ synchronization to finish."
             self.txStateChanged.emit()
             return
-        settings = self._tx_settings.copy()
+        settings = copy.deepcopy(self._tx_settings)
+        if live and self.radar_tx is not None:
+            # Role edits stay staged even when another control changes live.
+            settings["tx_sensors"] = [f"{self.pool.names[b]}.{a}" for b, a in sorted(self.radar_tx.selected)]
         try:
             candidate = RadarTransmitter(self.pool, SimpleNamespace(**settings))
             if not candidate.antennas:
-                raise ValueError("Select at least one TX sensor in the Transmission tab")
-            cfg = {key: settings[key] for key in self.PING_TX_DEFAULTS}
+                raise ValueError("Select at least one TX sensor in the app sidebar")
+            cfg = {key: settings.get(key, default) for key, default in self.PING_TX_DEFAULTS.items()}
+            from radar_waveform import reference_config
+            cfg = reference_config(cfg, settings)
             waveform = self._build_ping_waveform(cfg)
         except Exception as error:
             self._tx_status = str(error)
             self.txStateChanged.emit()
             return
+
+        previous = self.radar_tx
 
         def start():
             if self._tx_setup(settings) != self._calibrated_tx_setup:
@@ -801,9 +827,13 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 # returning the controls to earlier values cannot revive it.
                 self._calibrated_tx_setup = None
                 self._tx_calibration_valid = False
-            self._stop_ping_tx()
+            if not live:
+                self._stop_ping_tx()
             self.radar_tx = candidate
-            candidate.configure()
+            if live and self._tx_setup(settings) == self._tx_setup(vars(previous.args)):
+                candidate.session = previous.session
+            else:
+                candidate.configure()
             reference = candidate.start(waveform, cfg["tx_gain_db"])
             valid = self._tx_setup(settings) == self._calibrated_tx_setup and candidate.calibration_valid()
             return reference, cfg, bool(valid)
@@ -816,6 +846,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     @PyQt6.QtCore.pyqtSlot()
     def stopTx(self):
         if not self.txBusy:
+            self._live_tx_pending = False
+            self._live_tx_timer.stop()
             self._run_tx_operation(self._stop_ping_tx, "Stopping TX…")
 
     def _run_tx_operation(self, operation, status):
@@ -851,6 +883,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 valid = error is None and result is not None and result[2]
                 self._tx_calibration_valid = valid
                 self.iqcontrol._end_reference(valid)
+                self._check_tx_settings_calibration()
             else:
                 self.iqcontrol._correction_cache.clear()
         self._tx_calibrating = False
@@ -865,12 +898,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         )
         self._angle_status = self._tx_status
         self._tx_busy = False
+        if error:
+            self._live_tx_pending = False
         self.angleChanged.emit()
         self.txStateChanged.emit()
 
     @PyQt6.QtCore.pyqtSlot(float, int, float, int)
     def _start_ping_tx(self, gain, chirp_frames, bandwidth_hz, pings_per_256):
-        self._tx_settings.update(tx_gain_db=gain, chirp_frames=chirp_frames, bandwidth_hz=bandwidth_hz, pings_per_256=pings_per_256)
+        for key, value in dict(tx_gain_db=gain, chirp_frames=chirp_frames, bandwidth_hz=bandwidth_hz, pings_per_256=pings_per_256).items():
+            self.setTxSetting(key, value)
         self.startTx()
 
     def _stop_ping_tx(self):
@@ -1000,7 +1036,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # to the restored waveform, then average circularly across replay wrap.
         corrections = {c.state.antenna: c.delay_s for g in timing.calibration.select(direction="tx").groups for c in g.corrections}
         delays = [delay + corrections[a] for a, delay in timing.delays_s.items()]
-        period = CHUNK_SAMPLES / 80e6
+        tx = getattr(self, "radar_tx", None)
+        args = getattr(tx, "args", None)
+        samples = getattr(args, "samples", CHUNK_SAMPLES)
+        period = samples / getattr(args, "fs_hz", 80e6)
         phase = np.mean(np.exp(2j * np.pi * np.asarray(delays) / period))
         return float((np.angle(phase) % (2 * np.pi)) * period / (2 * np.pi) * self._spectrum_sample_rate_hz)
 
@@ -1543,12 +1582,14 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _synchronize_radar(self):
         """The central button calibrates the requested roles, even with TX stopped."""
-        settings = self._tx_settings.copy()
+        settings = copy.deepcopy(self._tx_settings)
         resume = self.txActive
         stage = "validating requested setup"
         self._radar_timing = None
         try:
-            cfg = {key: settings[key] for key in self.PING_TX_DEFAULTS}
+            cfg = {key: settings.get(key, default) for key, default in self.PING_TX_DEFAULTS.items()}
+            from radar_waveform import reference_config
+            cfg = reference_config(cfg, settings)
             waveform = self._build_ping_waveform(cfg)
             candidate = RadarTransmitter(self.pool, SimpleNamespace(**settings))
             self._stop_ping_tx()
@@ -1582,6 +1623,14 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             if reference is not None:
                 stage = "measuring zero-range TX/RX delay through " + settings["timing_path"]
                 self._radar_timing = calibrate_radar_timing(self.pool, candidate.antennas, settings["timing_path"], self.logger)
+                # Timing probes temporarily use 80 MSa/s. Restoring the RX
+                # rate can restart capture, so transfer corrections to the
+                # restored grid before publishing success or resuming TX.
+                stage = "refreshing calibration after restoring RX capture settings"
+                current = self.pool.refresh_calibration()
+                self._radar_timing = self._radar_timing.for_calibration(current)
+                if not candidate.calibration_valid():
+                    raise RuntimeError("Calibration does not cover the restored RX/TX state")
             resume = resume and not getattr(self, "_shutting_down", False)
             if resume and reference is not None:
                 candidate.session.mute(False)
@@ -1660,6 +1709,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def onAboutToQuit(self):
         self._shutting_down = True
+        self._live_tx_timer.stop()
+        self.txcontrol.timer.stop()
+        self.txcontrol.poll.stop()
+        self.txcontrol.executor.shutdown(wait=True)
         self.render_running = False
         if self._tx_worker is not None:
             self._tx_worker.join()

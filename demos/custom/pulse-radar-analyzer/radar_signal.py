@@ -1,6 +1,31 @@
 """Receive references and board-local geometry shared by both radar demos."""
 
 import numpy as np
+from fractions import Fraction
+from math import gcd
+from scipy.signal import resample
+
+
+def resample_replay(waveform, transmit_rate_hz, receive_rate_hz):
+    """Fourier-resample a periodic complex replay without spectral images.
+
+    Repeat whole periods when necessary so the output has an integral sample
+    count at the exact requested rate (e.g. 80 -> 8 MSa/s for 256 samples).
+    Resample before extracting a chirp, preserving its actual surrounding silence.
+    """
+    rates = np.asarray([transmit_rate_hz, receive_rate_hz], dtype=float)
+    if not np.isfinite(rates).all() or np.any(rates <= 0):
+        raise ValueError("TX and RX sample rates must be positive and finite")
+    waveform = np.asarray(waveform, dtype=np.complex64)
+    if waveform.size == 0 or rates[0] == rates[1]:
+        return waveform.copy()
+    ratio = Fraction(float(rates[1] / rates[0])).limit_denominator(10000)
+    if not np.isclose(float(ratio), rates[1] / rates[0], rtol=1e-10, atol=0):
+        raise ValueError("Sample-rate ratio cannot be represented accurately")
+    repeats = ratio.denominator // gcd(waveform.size, ratio.denominator)
+    repeated = np.tile(waveform, repeats)
+    count = repeated.size * ratio.numerator // ratio.denominator
+    return resample(repeated, count).astype(np.complex64)
 
 
 def matched_filter_peaks(received, reference, correlation, threshold=0.6):
@@ -32,7 +57,7 @@ def matched_filter_peaks(received, reference, correlation, threshold=0.6):
     return candidates.tolist()
 
 
-def chirp_reference(waveform, config, receive_rate_hz, transmit_rate_hz):
+def chirp_reference(waveform, config, receive_rate_hz, transmit_rate_hz, *, bandlimited=False):
     """Sample the submitted replay, rather than regenerate an ideal chirp.
 
     ADC decimation directly subsamples the replay. For a faster RX clock
@@ -42,14 +67,21 @@ def chirp_reference(waveform, config, receive_rate_hz, transmit_rate_hz):
     """
     period = 256 // max(1, min(int(config["pings_per_256"]), 256))
     length = max(1, min(int(config["chirp_frames"]), period))
+    if config.get("waveform_editor"):
+        period = length = len(waveform)
     ratio = float(transmit_rate_hz) / float(receive_rate_hz)
     if not np.isfinite(ratio) or ratio <= 0:
         raise ValueError("TX and RX sample rates must be positive and finite")
     waveform = np.asarray(waveform, dtype=np.complex64)
-    if ratio >= 1 and np.isclose(ratio, round(ratio)):
-        reference = waveform[: length : round(ratio)]
+    delay = int(config.get("reference_delay_samples", 0))
+    first = int(np.ceil(delay / ratio))
+    last = int(np.ceil((delay + length) / ratio))
+    if bandlimited:
+        reference = resample_replay(waveform, transmit_rate_hz, receive_rate_hz)[first:last]
+    elif ratio >= 1 and np.isclose(ratio, round(ratio)):
+        reference = waveform[first * round(ratio) : last * round(ratio) : round(ratio)]
     else:
-        positions = np.arange(int(np.ceil(length / ratio))) * ratio
+        positions = np.arange(first, last) * ratio
         bins = np.fft.fftfreq(waveform.size)
         reference = np.exp(2j * np.pi * positions[:, None] * bins) @ np.fft.fft(waveform) / waveform.size
     return np.asarray(reference, dtype=np.complex64), max(1, int(np.ceil(period / ratio)))

@@ -39,7 +39,7 @@ now use these paths:
 
 Both pulse analyzers import the current shared IQ framework from
 `demos.custom.common.iq_application` and `demos.custom.common.iq_waterfall`. The ESPARGOS
-Transmission tab uses the beamspace component copied from `iq/transmit-beamforming` into `demos/custom/common`.
+Transmitter sidebar uses the beam editor and beamspace components copied from `iq/transmit-beamforming` into `demos/custom/common`.
 Calibration runs through `Pool.calibrate()`; reciprocal RX helpers stay within
 the calibration selection, and final receive refinement preserves TX epochs.
 The receive drawer supports mixed TX/RX boards and updates only receive sensors;
@@ -110,8 +110,9 @@ Both demos correlate each receive channel with the same complex, conjugated,
 time-reversed transmitted chirp: `z_a[k] = sum_n x_a[k+n] conj(s[n])`.
 The template comes from the submitted replay samples (including ESPARGOS
 source quantization), with chirp settings frozen when that replay is started.
-It is sampled on the actual RX clock: ESPARGOS replay runs at 80 MSa/s and
-Pluto at 40 MSa/s. Faster reception of Pluto uses Fourier interpolation of
+It is sampled on the actual RX clock. The ESPARGOS variant Fourier-resamples
+its selectable TX source rate onto the receive grid; its hardware replay still
+runs at 80 MSa/s. Pluto runs at 40 MSa/s. Faster reception of Pluto uses Fourier interpolation of
 the cyclic DAC sequence. This models an ideal DAC; analog filter distortion
 is not measured or included in the template. Output index `k` is the pulse
 start, and the peak detector normalizes over those same chirp samples.
@@ -170,7 +171,7 @@ python demos/custom/pulse-radar-analyzer/pulse-radar-analyzer-espargi.py \
     -c config/rx-and-tx-espargos.yml
 ```
 
-Wait for startup synchronization, then open the **Transmission** tab:
+Wait for startup synchronization, then open **App → Transmitter** in the side panel:
 
 1. Check **All** beside `espargostx` to transmit on that board. Leave
    `espargosrx` unchecked so its sensors receive. Alternatively, select
@@ -180,11 +181,11 @@ Wait for startup synchronization, then open the **Transmission** tab:
 3. Click the central **Sync + Calibration** button in the Receive drawer.
    It applies the selected TX/RX roles and settings, prepares the chirp, and
    calibrates both transmission and reception, including when TX is stopped.
-4. Click **Apply and start TX** whenever ready. Start/Stop does not calibrate
+4. Click **Apply roles / Start TX** whenever ready. Start/Stop does not calibrate
    or restart unchanged replay engines. Starting before calibration is allowed;
    the status and Sync button indicate that corrections need measurement.
-5. Switch to **Receive** and choose the `espargosrx` board tab. Use the Display
-   drawer to choose power, phase, I/Q, constellation, spectrum, angle, or radar.
+5. Choose the `espargosrx` receive board tab. Use **App → Display**
+   to choose power, phase, I/Q, constellation, spectrum, angle, or radar.
 
 **Stop TX** mutes transmission. Closing the demo waits for any active setup
 operation, mutes TX, and restores WiFi mode. Leave at least one sensor receiving.
@@ -193,15 +194,58 @@ completeness, clutter calibration, or angle processing. Angle estimation needs
 at least four receive antennas in the selected board. Receive views process one
 selected board at a time; they do not combine apertures across board tabs.
 
-The Transmission tab includes the same draggable beamspace view as
-`iq-transmit-beamforming`; dragging its marker updates the azimuth and elevation
-fields. Apply and start TX sends the new direction to the selected sensors.
+The receive view stays visible while the nonmodal sidebar is open. Running TX
+updates automatically after beam, waveform, chirp, gain, or RF edits; rapid
+steering edits are coalesced and the latest direction is applied after the
+current hardware operation finishes. TX/RX assignments remain staged until
+**Apply roles / Start TX** or **Sync + Calibration**, even if another setting
+updates in the meantime. Settings edited while TX is stopped are used at start.
+
+Select one to four beams and drag each numbered marker independently. Each
+beam has its own amplitude and squint correction. By default, all beams use
+the existing radar pulse settings. Enable **Use IQ demo waveforms** to use the
+IQ transmission demo's per-beam CW, two-tone, LFM, noise, QPSK, or I/Q-file
+waveforms and 256–8192-sample replay lengths. The single per-beam
+**Amplitude / digital gain** field sets the linear amplitude and shows its dB
+value. Amplitude is applied once and divided by the number of beams; the legacy
+`tx_gain_db` configuration is an alias for beam 1, not an extra multiplier. Beam 1's
+unsteered waveform supplies the common receive matched-filter reference;
+returns from other waveform types may not correlate with that reference.
+The sidebar provides waveform previews and the extended power range switch.
+The reference monitor section has been removed. Preview and transmission use
+the same quantized source in both pulse and IQ waveform modes.
+
+**TX sampling rate** selects the source waveform rate: 80 (default), 40, 20,
+10, 5, or 2.5 MSa/s. It is also configurable with `-o app.fs_hz=20000000`.
+Chirp duration and delay are entered in samples at that rate (50 ns each at
+20 MSa/s). The ESPARGOS DAC still replays at 80 MSa/s: the demo converts the
+source with `scipy.signal.resample`, preserving duration and frequency content.
+The allowed source replay lengths shrink at lower rates so the converted
+hardware buffer fits within 8192 samples. Changing the source rate requires
+Sync + Calibration for the resulting replay timing.
+
+The duration field and lower chirp-length setting control the same sample count.
+Chirp bandwidth sets symmetric sweep limits at −BW/2 and +BW/2, using the
+existing replay frequency-bin quantization. **Chirps per 256 samples** sets
+repetition and caps duration plus delay to one pulse period. Longer replay
+buffers repeat this 256-sample pattern. These settings update the preview live,
+including silence and delay. IQ-mode LFM uses these same chirp controls.
+The receive template Fourier-resamples the complete periodic source onto the
+RX grid before extracting the chirp, excluding its delay and tail silence.
+It keeps TX steering and amplitude out of the reference,
+preserving correlation peak positions and relative receive phase.
 
 The radar defaults to 2400 MHz, gain A/B 0, 40 MHz RF bandwidth, and right
 antenna output. Both RF gains permit 0–7. Digital waveform gain defaults to
 -20 dB and permits up to 0 dB (full-scale amplitude 1). The RF filter choices
 include open (0), 13, 20, 40, and 60 MHz; output choices include isolation.
-Chirp sweep bandwidth can reach 80 MHz at the fixed 80 MSa/s replay rate.
+Chirp sweep bandwidth is limited to the selected TX source sampling rate.
+For a 20 MHz radar signal, select a 20 MSa/s TX source rate, 20 MHz chirp
+bandwidth, 20 MHz TX RF filter, and 20 MSa/s RX with a suitable RX filter.
+The source is interpolated to 80 MSa/s for transmission without interpolation
+images. Analog filter rolloff and hardware quantization still apply; the
+sampling-rate setting does not change the DAC clock or create a digital IQ
+interface to an external simulator.
 The center frequency remains within 2310–2640 MHz for broadband calibration.
 Calibration defaults to reciprocity via the reference path. Choosing monitor
 calibration selects the required reference path automatically. Reciprocity uses
@@ -256,14 +300,17 @@ the bearing of one physical reflector. TX steering changes illumination;
 it is not a known-angle receive reference. Absolute angle accuracy needs an
 isolated source or reflector with a measured bearing.
 
-Replay uses 80 MSa/s; receive sample rate is controlled in the Receive drawer.
+Hardware replay uses 80 MSa/s; the TX source rate is selected in Transmission
+setup and receive sample rate is controlled in the Receive drawer.
 The chirp count must divide 256 (1, 2, 4,
 8, …); chirp length is capped at one pulse period. The uploaded quantized
-chirp is also the matched-filter reference, subsampled onto the actual RX
-sample rate when reception runs below 80 MSa/s. Each RX channel uses this same
+chirp is also the matched-filter reference, Fourier-resampled onto the actual
+RX sample rate when the TX and RX rates differ. This filters out-of-band
+content when downsampling rather than aliasing it into additional components.
+The converter repeats complete source periods when needed to represent the
+exact rate ratio, rather than rounding the sample interval. Each RX channel uses this same
 complex reference, excluding TX steering and TX calibration coefficients, so
-relative receive phase remains available for angle estimation. Chirp settings
-are frozen when transmission starts; click **Apply and start TX** to apply edits.
+relative receive phase remains available for angle estimation. Chirp and waveform references update after each successful live TX update.
 Changing RX frequency or sample rate invalidates the corresponding calibration;
 use Sync + Calibration to measure the new setup. Starting TX never performs
 that measurement automatically. Receive fine calibration
@@ -275,8 +322,8 @@ and ping traces; angle/radar processing retains its coherent calibration path.
 The RX drawer's Sync action runs combined TX/RX calibration for the selected
 settings whether transmission is active or stopped. Active transmission resumes
 after successful calibration; stopped transmission stays muted. Start/Stop,
-digital gain, chirp edits at the fixed 256-sample replay length, and steering
-reuse valid calibration. Changes to sensor roles or RF settings mark it stale;
+digital gain, chirp edits at an unchanged replay length, and steering
+reuse valid calibration. Changes to source rate, replay length, sensor roles or RF settings mark it stale;
 use Sync + Calibration to measure the new setup. Both startup and later
 calibration use the YAML reference-cable lengths. Calibration acquisition chunks
 are excluded from the displays, and incomplete captures are checked against the
@@ -296,7 +343,7 @@ apply; clipped captures and unrelated configuration errors are not retried.
 A failed higher-gain measurement leaves TX muted and reports the error.
 
 The timing path can be selected independently of array phase calibration in
-Transmission settings or with `--timing-path`. Optional `antenna_r`/`antenna_l`
+the Transmitter sidebar or with `--timing-path`. Optional `antenna_r`/`antenna_l`
 timing treats direct-path propagation as negligible and requires no board
 positions or distances. Its measured zero includes the actual direct-path delay,
 shifting equivalent monostatic range by half the TX-to-RX path length.

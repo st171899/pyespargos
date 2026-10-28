@@ -9,6 +9,8 @@ GridLayout {
     id: root
     required property var controller
     property int beamIndex: 0
+    property bool steeringFirst: false
+    property bool sampleTiming: false
     readonly property var state: controller.state
     readonly property var beam: state.beams[beamIndex]
     onStateChanged: { if (beamIndex >= state.count) beamIndex = state.count-1 }
@@ -18,6 +20,8 @@ GridLayout {
     Layout.minimumHeight: columns === 1 ? 900 : 560
     enabled: state.authorized && !state.exclusive && !state.closing
     TabBar {
+        Layout.row: 0
+        Layout.column: 0
         Layout.columnSpan: root.columns
         Layout.fillWidth: true
         currentIndex: root.beamIndex
@@ -31,6 +35,8 @@ GridLayout {
         }
     }
     ColumnLayout {
+        Layout.row: root.columns === 1 && root.steeringFirst ? 2 : 1
+        Layout.column: 0
         Layout.leftMargin: 15
         Layout.rightMargin: root.columns === 1 ? 15 : 0
         Layout.bottomMargin: 15
@@ -89,9 +95,10 @@ GridLayout {
                 currentIndex: ["cw","two-tone","lfm","noise","qpsk","file"].indexOf(root.beam.type)
                 onActivated: root.controller.setBeam(root.beamIndex,"type",currentValue)
             }
-            Label { text: "Peak amplitude" }
+            Label { text: root.sampleTiming ? "Amplitude / digital gain" : "Peak amplitude" }
             RowLayout {
                 Layout.fillWidth: true
+                visible: !root.sampleTiming
                 Slider {
                     objectName: "txAmplitude"
                     Layout.fillWidth: true
@@ -103,29 +110,60 @@ GridLayout {
                 }
                 Label { text: root.beam.amplitude.toFixed(3); Layout.preferredWidth: 48; horizontalAlignment: Text.AlignRight }
             }
+            ColumnLayout {
+                visible: root.sampleTiming
+                Layout.fillWidth: true
+                IQTxNumber {
+                    objectName: "radarSignalAmplitude"
+                    Layout.fillWidth: true
+                    value: root.beam.amplitude; minimum: 0; maximum: root.state.unlocked ? 1 : 0.4; decimals: 6
+                    onEdited: number => root.controller.setBeam(root.beamIndex, "amplitude", number)
+                }
+                Label { text: root.beam.amplitude > 0 ? (20*Math.log10(root.beam.amplitude)).toFixed(2) + " dB" : "Muted (0 amplitude)" }
+            }
             Label { text: "Offset (MHz)"; visible: root.beam.type === "cw" }
             IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "cw"; value: root.beam.offset_mhz; minimum: -40; maximum: 40; onEdited: number => root.controller.setBeam(root.beamIndex,"offset_mhz",number) }
             Label { text: "First offset (MHz)"; visible: root.beam.type === "two-tone" }
             IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "two-tone"; value: root.beam.first_mhz; minimum: -40; maximum: 40; onEdited: number => root.controller.setBeam(root.beamIndex,"first_mhz",number) }
             Label { text: "Second offset (MHz)"; visible: root.beam.type === "two-tone" }
             IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "two-tone"; value: root.beam.second_mhz; minimum: -40; maximum: 40; onEdited: number => root.controller.setBeam(root.beamIndex,"second_mhz",number) }
-            Label { text: "Sweep (MHz)"; visible: root.beam.type === "lfm" }
+            Label { text: "Sweep (MHz)"; visible: root.beam.type === "lfm" && !root.sampleTiming }
             RowLayout {
-                visible: root.beam.type === "lfm"
+                visible: root.beam.type === "lfm" && !root.sampleTiming
                 IQTxNumber { Layout.preferredWidth: 80; value: root.beam.start_mhz; minimum: -40; maximum: 40; onEdited: number => root.controller.setBeam(root.beamIndex,"start_mhz",number) }
                 Label { text: "to" }
                 IQTxNumber { Layout.preferredWidth: 80; value: root.beam.stop_mhz; minimum: -40; maximum: 40; onEdited: number => root.controller.setBeam(root.beamIndex,"stop_mhz",number) }
             }
-            Label { text: "Duration (µs)"; visible: root.beam.type === "lfm" }
-            IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "lfm"; value: root.beam.duration_us; minimum: 0.0125; maximum: 102.4; decimals: 4; onEdited: number => root.controller.setBeam(root.beamIndex,"duration_us",number) }
-            Label { text: "Delay (µs)"; visible: root.beam.type === "lfm" }
-            IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "lfm"; value: root.beam.delay_us; minimum: 0; maximum: 102.4; decimals: 4; onEdited: number => root.controller.setBeam(root.beamIndex,"delay_us",number) }
+            Label { text: "Duration (µs)"; visible: root.beam.type === "lfm" && !root.sampleTiming }
+            IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "lfm" && !root.sampleTiming; value: root.beam.duration_us; minimum: 0.0125; maximum: 102.4; decimals: 4; onEdited: number => root.controller.setBeam(root.beamIndex,"duration_us",number) }
+            Label { text: "Delay (µs)"; visible: root.beam.type === "lfm" && !root.sampleTiming }
+            IQTxNumber { Layout.fillWidth: true; visible: root.beam.type === "lfm" && !root.sampleTiming; value: root.beam.delay_us; minimum: 0; maximum: 102.4; decimals: 4; onEdited: number => root.controller.setBeam(root.beamIndex,"delay_us",number) }
+            Label { text: "Sweep (MHz)"; visible: root.sampleTiming && root.beam.type === "lfm" }
+            Label { text: root.beam.start_mhz.toFixed(3) + " to " + root.beam.stop_mhz.toFixed(3); visible: root.sampleTiming && root.beam.type === "lfm" }
+            Label { text: "Duration (samples)"; visible: root.sampleTiming && (!root.state.waveform_editor || root.beam.type === "lfm") }
+            SpinBox {
+                objectName: "radarSignalDuration"
+                visible: root.sampleTiming && (!root.state.waveform_editor || root.beam.type === "lfm")
+                from: 1; to: (root.state.pulse_period || 256) - (root.beam.delay_samples || 0)
+                value: root.beam.duration_samples || 1; editable: true
+                onValueModified: root.controller.setBeam(root.beamIndex, "duration_samples", value)
+            }
+            Label { text: "Delay (samples)"; visible: root.sampleTiming && (!root.state.waveform_editor || root.beam.type === "lfm") }
+            SpinBox {
+                objectName: "radarSignalDelay"
+                visible: root.sampleTiming && (!root.state.waveform_editor || root.beam.type === "lfm")
+                from: 0; to: (root.state.pulse_period || 256) - 1
+                value: root.beam.delay_samples || 0; editable: true
+                onValueModified: root.controller.setBeam(root.beamIndex, "delay_samples", value)
+            }
             Button { text: "Upload I/Q file"; visible: root.beam.type === "file"; Layout.columnSpan: 2; onClicked: fileDialog.open() }
             Label { text: root.beam.file.split('/').pop() || "Choose a file"; visible: root.beam.type === "file"; Layout.columnSpan: 2; elide: Text.ElideMiddle; Layout.maximumWidth: 330 }
         }
         Item { Layout.fillHeight: true }
     }
     ColumnLayout {
+        Layout.row: root.columns === 1 && !root.steeringFirst ? 2 : 1
+        Layout.column: root.columns === 1 ? 0 : 1
         Layout.leftMargin: root.columns === 1 ? 15 : 0
         Layout.rightMargin: 15
         Layout.bottomMargin: 15

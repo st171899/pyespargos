@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import sys
 import unittest
 import time
-from unittest.mock import Mock, patch
+import threading
+from unittest.mock import Mock, MagicMock, patch
 
 import numpy as np
+from scipy.signal import resample
 
 DEMO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DEMO))
@@ -22,6 +24,87 @@ Analyzer = module.EspargosPulseRadarAnalyzer
 
 
 class RadarTXTest(unittest.TestCase):
+    def test_failed_calibration_does_not_announce_success(self):
+        backend = SimpleNamespace(
+            iqcontrol=SimpleNamespace(syncNeeded=True),
+            block_acc={1: 'old'}, block_time={1: 0}, last_display_block=1,
+            _pending_lock=threading.Lock(), _pending_clusters=['old'], angleChanged=Mock(),
+        )
+        Analyzer._on_iq_calibration_changed(backend)
+        self.assertNotIn('calibration complete', backend._angle_status)
+        self.assertIn('Run Sync + Calibration', backend._angle_status)
+        self.assertEqual(backend._pending_clusters, [])
+        backend.iqcontrol.syncNeeded = False
+        Analyzer._on_iq_calibration_changed(backend)
+        self.assertIn('calibration complete', backend._angle_status)
+
+    def test_timing_probe_restoration_refreshes_epoch_before_publishing_success(self):
+        from espargos.iq_receiver import IQReceiver
+        from demos.custom.common.iq_application import IQController
+
+        tx, pool = self.setup_tx(['espargostx'])
+        settings = dict(vars(tx.args), chirp_frames=16, bandwidth_hz=20e6,
+                        pings_per_256=2, tx_gain_db=-20, fs_hz=20e6)
+        old = np.zeros((2, 2, 4), np.uint64)
+        old[0] = 100
+        restored = old.copy()
+        restored[0] = 200
+        present = restored != 0
+        capture = SimpleNamespace(fire_time_ns=restored, completion=present, sample_rate_hz=20e6)
+        receiver = SimpleNamespace(_calibration=object(), _calibration_epoch=old.tobytes())
+        receiver.calibration_applies_to = lambda frame: IQReceiver.calibration_applies_to(receiver, frame)
+        control = SimpleNamespace(receiver=receiver, _reference_busy=False, calibration_guard=lambda: True,
+                                  _set_sync_needed=lambda needed: setattr(control, 'syncNeeded', needed))
+        timing, current = Mock(), object()
+
+        def measure(*args):
+            # The timing probe succeeded, but 80 -> 20 MSa/s restoration has
+            # changed the RX epoch. This used to turn the button red afterward.
+            IQController._observe_capture(control, capture)
+            self.assertTrue(control.syncNeeded)
+            return timing
+
+        def refresh():
+            receiver._calibration_epoch = restored.tobytes()
+            return current
+
+        pool.refresh_calibration.side_effect = refresh
+        backend = SimpleNamespace(
+            txActive=False, pool=pool, _tx_settings=settings,
+            PING_TX_DEFAULTS=Analyzer.PING_TX_DEFAULTS, _stop_ping_tx=Mock(),
+            _build_ping_waveform=Mock(return_value=np.ones(256, complex)),
+            _tx_setup=Analyzer._tx_setup, radarCalibrationDone=Mock(), logger=Mock(),
+        )
+        candidate = Mock(antennas=tx.antennas)
+        candidate.calibration_valid.side_effect = lambda: receiver.calibration_applies_to(capture)
+        with patch.object(module, 'RadarTransmitter', return_value=candidate), patch.object(module, 'calibrate_radar_timing', side_effect=measure):
+            Analyzer._synchronize_radar(backend)
+        timing.for_calibration.assert_called_once_with(current)
+        self.assertTrue(backend._tx_calibration_valid)
+        self.assertIsNone(backend.radarCalibrationDone.emit.call_args.args[0][-1])
+        IQController._observe_capture(control, capture)
+        self.assertFalse(control.syncNeeded)
+
+    def test_invalid_restored_state_cannot_report_calibration_complete(self):
+        tx, pool = self.setup_tx(['espargostx'])
+        settings = dict(vars(tx.args), chirp_frames=16, bandwidth_hz=20e6,
+                        pings_per_256=2, tx_gain_db=-20)
+        backend = SimpleNamespace(
+            txActive=False, pool=pool, _tx_settings=settings,
+            PING_TX_DEFAULTS=Analyzer.PING_TX_DEFAULTS, _stop_ping_tx=Mock(),
+            _build_ping_waveform=Mock(return_value=np.ones(256, complex)),
+            _tx_setup=Analyzer._tx_setup, radarCalibrationDone=Mock(), logger=Mock(),
+        )
+        candidate = Mock(antennas=tx.antennas)
+        candidate.calibration_valid.return_value = False
+        with patch.object(module, 'RadarTransmitter', return_value=candidate):
+            with self.assertRaisesRegex(RuntimeError, 'restored RX/TX state'):
+                Analyzer._synchronize_radar(backend)
+        self.assertFalse(backend._tx_calibration_valid)
+        self.assertIsNone(backend._radar_timing)
+        self.assertIsNone(backend._calibrated_tx_setup)
+        self.assertIn('restored RX/TX state', backend.radarCalibrationDone.emit.call_args.args[0][-1])
+
     def test_reference_timing_retries_weak_or_unstable_probes_at_higher_gain(self):
         from radar_tx import calibrate_radar_timing
         from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
@@ -141,6 +224,7 @@ class RadarTXTest(unittest.TestCase):
         pool._lock = nullcontext()
         pool.antennas = tuple(module.espargos.Antenna(host, a) for host in pool.hosts for a in range(8))
         pool.tx.authorization = [True, True]
+        pool.tx.signals = MagicMock()
         pool.tx.update.side_effect = lambda **kw: nullcontext()
         pool.boards = [Mock(), Mock()]
         for board in pool.boards:
@@ -191,7 +275,7 @@ class RadarTXTest(unittest.TestCase):
         waveform = Analyzer._build_ping_waveform(None, cfg)
         reference = tx.start(waveform, -20)
         settings = pool.tx.signals.add.call_args.kwargs
-        self.assertEqual(settings["steering"].azimuth_deg, 25)
+        self.assertAlmostEqual(settings["steering"].azimuth_deg, 25)
         np.testing.assert_array_equal(reference, settings["waveform"].synthesize(256))
         pool.calibrate.assert_not_called()
         self.assertEqual(pool.tx.mute.call_args.args, (False,))
@@ -203,6 +287,69 @@ class RadarTXTest(unittest.TestCase):
         self.assertEqual(np.argmax(np.abs(a)), 12)
         tx.stop()
         self.assertEqual(pool.tx.mute.call_args.args, (True,))
+
+    def test_multiple_beams_update_existing_signals_and_keep_common_reference(self):
+        from demos.custom.common.iq_tx_waveform import default_beam_settings
+        tx, pool = self.setup_tx(["espargostx"])
+        tx.configure()
+        class Signals(list):
+            def add(self, **settings):
+                signal = Mock()
+                signal.settings = settings
+                self.append(signal)
+        pool.tx.signals = Signals()
+        tx.args.beams = [default_beam_settings(), default_beam_settings()]
+        tx.args.beams[0].update(u=-0.5, amplitude=0.2)
+        tx.args.beams[1].update(u=0.5, amplitude=0.4, type="two-tone")
+        tx.args.waveform_editor = True
+        tx.args.samples = 512
+        reference = tx.start(np.ones(256, complex), 0)
+        self.assertEqual(len(pool.tx.signals), 2)
+        self.assertAlmostEqual(pool.tx.signals[0].settings["steering"].azimuth_deg, -30)
+        self.assertAlmostEqual(pool.tx.signals[1].settings["steering"].azimuth_deg, 30)
+        self.assertEqual([s.settings["amplitude"] for s in pool.tx.signals], [0.1, 0.2])
+        self.assertNotIn(unittest.mock.call(True), pool.tx.mute.call_args_list)
+        np.testing.assert_array_equal(reference, pool.tx.signals[0].settings["waveform"].synthesize(512))
+        tx.args.beams[1]["u"] = 0.25
+        tx.start(np.ones(256, complex), 0)
+        self.assertEqual(len(pool.tx.signals), 2)
+        self.assertAlmostEqual(pool.tx.signals[1].update.call_args.kwargs["steering"].azimuth_deg, np.degrees(np.arcsin(0.25)))
+        received_reference, period = module.receive_chirp_reference(reference, dict(waveform_editor=True, chirp_frames=16, pings_per_256=2), 40e6)
+        np.testing.assert_allclose(received_reference, resample(reference.astype(np.complex64), 256), atol=1e-7)
+        self.assertEqual(period, 256)
+
+    def test_sample_chirps_share_transmit_reference_and_single_amplitude(self):
+        from radar_waveform import beam_source, reference_config
+        from demos.custom.common.iq_tx_waveform import default_beam_settings
+        tx, pool = self.setup_tx(["espargostx"])
+        tx.configure()
+        beam = default_beam_settings()
+        beam.update(type="lfm", amplitude=0.1, delay_samples=5)
+        settings = dict(chirp_frames=24, bandwidth_hz=20e6, pings_per_256=4,
+                        waveform_editor=True, samples=512, beams=[beam])
+        vars(tx.args).update(settings)
+        reference = tx.start(np.zeros(256, complex), -20)
+        applied = pool.tx.signals.add.call_args.kwargs
+        self.assertAlmostEqual(applied["amplitude"], 0.1)  # -20 dB is not multiplied twice.
+        np.testing.assert_array_equal(reference, beam_source(beam, settings, 512).synthesize(512))
+        self.assertEqual(np.count_nonzero(reference), 24 * 8)
+        self.assertTrue(np.all(reference[:5] == 0))
+        cfg = reference_config(settings, settings)
+        for rate, stride in ((80e6, 1), (40e6, 2), (16e6, 5)):
+            template, period = module.receive_chirp_reference(reference, cfg, rate)
+            # Anti-aliased Fourier resampling replaces unfiltered subsampling.
+            repeats = 1 if stride in (1, 2) else 5
+            replay = np.tile(reference.astype(np.complex64), repeats)
+            expected = replay if stride == 1 else resample(replay, replay.size // stride)
+            np.testing.assert_allclose(template, expected[int(np.ceil(5/stride)):int(np.ceil(29/stride))], atol=1e-7)
+            self.assertEqual(period, int(np.ceil(64/stride)))
+        template, _ = module.receive_chirp_reference(reference, cfg, 80e6)
+        received = np.zeros(256, complex)
+        received[31:31+len(template)] = template * np.exp(0.7j)
+        backend = SimpleNamespace(_tx_waveform=reference, _reference_ping_config=lambda: cfg)
+        matched = Analyzer._angle_matched_trace(backend, received)
+        self.assertEqual(np.argmax(abs(matched)), 31)
+        self.assertAlmostEqual(np.angle(matched[31]), 0.7, places=5)
 
     def test_failed_waveform_update_mutes(self):
         tx, pool = self.setup_tx(["espargostx.0"])
@@ -308,7 +455,9 @@ class RadarTXTest(unittest.TestCase):
                 Analyzer._synchronize_radar(backend)
             pool.calibrate.assert_called_with(tx_method="reciprocity", path="reference", per_board=False)
             pool.calibrate_tx_rx_delay.assert_called_with(path="reference", rx_gain=24)
-            self.assertIs(backend._radar_timing, pool.calibrate_tx_rx_delay.return_value)
+            pool.refresh_calibration.assert_called()
+            pool.calibrate_tx_rx_delay.return_value.for_calibration.assert_called_with(pool.refresh_calibration.return_value)
+            self.assertIs(backend._radar_timing, pool.calibrate_tx_rx_delay.return_value.for_calibration.return_value)
             self.assertEqual(pool.calibrations.groups, ())
             self.assertIsNone(pool.iq._calibration)
             candidate.prepare.assert_called_once()

@@ -89,12 +89,17 @@ class IQTxPlot(QQuickPaintedItem):
         beam, n = state["beams"][self._beam], state["samples"]
         # Steering must not recalculate the preview or read a file on the UI thread.
         signature = (n,) + tuple(beam[k] for k in ("type", "amplitude", "offset_mhz", "first_mhz", "second_mhz", "start_mhz", "stop_mhz", "duration_us", "delay_us", "file"))
+        if hasattr(self._controller, "preview_signature"):
+            signature += self._controller.preview_signature(self._beam)
         cached = self._controller.file_previews.get(self._beam)
         signature += (cached[0] if cached else None,)
         if signature == self.signature:
             return
         self.signature = signature
         try:
+            if hasattr(self._controller, "preview_samples"):
+                self.set_samples(self._controller.preview_samples(self._beam))
+                return
             kind = beam["type"]
             if kind == "file":
                 # File samples are supplied by the worker after upload; never read disks here.

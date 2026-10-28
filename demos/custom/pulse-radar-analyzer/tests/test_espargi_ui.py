@@ -1,4 +1,4 @@
-"""Load the Transmission tab and exercise settings and asynchronous apply.
+"""Load the transmitter sidebar and exercise settings and asynchronous apply.
 
 Run separately with QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software.
 No radios or OpenGL shader backend are needed.
@@ -35,7 +35,7 @@ def visual_item(item, name):
 
 
 class TransmissionUITest(unittest.TestCase):
-    def test_tab_and_apply(self):
+    def test_sidebar_and_apply(self):
         spec = importlib.util.spec_from_file_location("espargi_ui", DEMO / "pulse-radar-analyzer-espargi.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -50,8 +50,12 @@ class TransmissionUITest(unittest.TestCase):
         self.assertTrue(app.engine.rootObjects())
         window = app.engine.rootObjects()[0]
         try:
-            tabs = window.findChild(QObject, "workspaceTabs")
-            self.assertIsNotNone(tabs)
+            self.assertIsNone(window.findChild(QObject, "workspaceTabs"))
+            pump()
+            drawer = window.property("appDrawer")
+            self.assertIsNotNone(drawer)
+            QMetaObject.invokeMethod(drawer, "open")
+            pump()
             board_tabs = window.findChild(QObject, "receiveBoardTabs")
             self.assertIsNotNone(board_tabs)
             for mode in ("angle", "radar"):
@@ -131,7 +135,8 @@ class TransmissionUITest(unittest.TestCase):
             self.assertTrue(app._clutter_calibrated)
             switch.setProperty("checked", False)
             pump()
-            tabs.setProperty("currentIndex", 1)
+            pump()
+            window.findChild(QObject, "radarSettingsTabs").setProperty("currentIndex", 1)
             pump()
             app.setTxSensor("espargostx", -1, True)
             app.setTxSensor("espargostx", 3, False)
@@ -139,6 +144,23 @@ class TransmissionUITest(unittest.TestCase):
             pump()
             self.assertTrue(visual_item(window.contentItem(), "txSensor_espargostx_0").property("checked"))
             self.assertFalse(visual_item(window.contentItem(), "txSensor_espargostx_3").property("checked"))
+            tx_rate = visual_item(window.contentItem(), "radarTxSampleRate")
+            self.assertIsNotNone(tx_rate)
+            app.setTxSetting("fs_hz", 20e6)
+            pump()
+            self.assertEqual(tx_rate.property("currentIndex"), 2)
+            self.assertEqual(app.txSettings["bandwidth_hz"], 20e6)
+            self.assertEqual(app.txcontrol.data["sample_counts"], [256, 512, 1024, 2048])
+            self.assertAlmostEqual(app.txcontrol.data["beams"][0]["duration_us"], 16/20)
+            app.txcontrol.setSetting("samples", 8192)
+            self.assertEqual(app.txcontrol.data["samples"], 256)
+            app.setTxSetting("fs_hz", 80e6)
+            app.txcontrol.setSetting("samples", 8192)
+            app.setTxSetting("fs_hz", 2.5e6)
+            self.assertEqual(app.txcontrol.data["samples"], 256)
+            self.assertEqual(app.txSettings["samples"], 256)
+            app.setTxSetting("fs_hz", 80e6)
+            app.setTxSetting("bandwidth_hz", 40e6)
             app.setTxSetting("frequency_mhz", 2420.5)
             app.setTxSetting("chirp_frames", 32.0)
             self.assertIsInstance(app.txSettings["chirp_frames"], int)
@@ -149,6 +171,33 @@ class TransmissionUITest(unittest.TestCase):
             self.assertAlmostEqual(app.txSettings["tx_elevation"], 0)
             self.assertIsNotNone(visual_item(window.contentItem(), "txBeamspace"))
             self.assertFalse(app.txActive)
+            from radar_waveform import beam_source
+            from demos.custom.common.iq_tx_plot import IQTxPlot
+            self.assertEqual(app.txcontrol.data["beams"][0]["amplitude"], 0.1)
+            app.txcontrol.setBeam(0, "amplitude", 0.25)
+            self.assertAlmostEqual(app.txSettings["tx_gain_db"], 20*module.np.log10(0.25))
+            app.setTxSetting("tx_gain_db", -20)
+            self.assertAlmostEqual(app.txcontrol.data["beams"][0]["amplitude"], 0.1)
+            plot = window.findChild(IQTxPlot, "txWaveformPreview")
+            self.assertIsNotNone(plot)
+            self.assertFalse(plot.monitor)
+            before = plot.z.copy()
+            app.setTxSetting("pings_per_256", 4)
+            app.setTxSetting("bandwidth_hz", 20e6)
+            app.txcontrol.setBeam(0, "duration_samples", 20)
+            app.txcontrol.setBeam(0, "delay_samples", 5)
+            pump()
+            beam = app.txcontrol.data["beams"][0]
+            self.assertEqual((beam["start_mhz"], beam["stop_mhz"]), (-10, 10))
+            self.assertEqual((beam["duration_samples"], beam["delay_samples"]), (20, 5))
+            expected = beam_source(beam, app.txSettings, 256).synthesize(256)*0.1
+            module.np.testing.assert_allclose(plot.z, expected)
+            self.assertFalse(module.np.array_equal(plot.z, before))
+            # Restore the setup used by the live-update checks below.
+            app.txcontrol.setBeam(0, "delay_samples", 0)
+            app.setTxSetting("pings_per_256", 2)
+            app.setTxSetting("chirp_frames", 32)
+            pump()
             app.iqcontrol = SimpleNamespace(referenceBusy=False, syncNeeded=True, _set_sync_needed=Mock(), _correction_cache={}, _begin_reference=Mock(return_value=True), _end_reference=Mock())
             release = threading.Event()
             reference = module.np.ones(256, dtype=complex)
@@ -157,8 +206,6 @@ class TransmissionUITest(unittest.TestCase):
             with patch.object(module, "RadarTransmitter", return_value=candidate) as factory:
                 app.startTx()
                 self.assertTrue(app.txBusy)
-                app.setTxSetting("frequency_mhz", 2500)
-                self.assertEqual(app.txSettings["frequency_mhz"], 2420.5)
                 release.set()
                 app._tx_worker.join(3)
                 pump()
@@ -168,12 +215,29 @@ class TransmissionUITest(unittest.TestCase):
                 self.assertEqual(app._active_ping_config["chirp_frames"], 32)
                 self.assertIn("Use Sync + Calibration", app.txStatus)
                 app.iqcontrol._end_reference.assert_called_with(False)
+                # Stage a different aperture, then drag repeatedly while TX is live.
+                candidate.selected = {(1, a) for a in range(8) if a != 3}
+                candidate.args = SimpleNamespace(**app.txSettings)
+                app.setTxSensor("espargosrx", 0, True)
+                app.txcontrol.setSetting("count", 2)
+                app.txcontrol.steer(1, -0.4, 0.2)
+                app.txcontrol.steer(1, 0.6, 0.1)
+                pump(250)
+                if app._tx_worker:
+                    app._tx_worker.join(3)
+                pump()
+                applied = factory.call_args.args[1]
+                self.assertEqual(len(applied.beams), 2)
+                self.assertAlmostEqual(applied.beams[1]["u"], 0.6)
+                self.assertNotIn("espargosrx.0", applied.tx_sensors)
+                self.assertIn("espargosrx.0", app.txSettings["tx_sensors"])
+                self.assertTrue(board_tabs.property("visible"))
+                self.assertTrue(app.txActive)
                 app.stopTx()
                 app._tx_worker.join(3)
                 pump()
                 self.assertFalse(app.txActive)
                 self.assertEqual(app.txStatus, "TX stopped.")
-            tabs.setProperty("currentIndex", 0)
             pump()
         finally:
             if app._tx_worker:

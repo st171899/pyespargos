@@ -99,6 +99,8 @@ class ReceiveLivenessTest(unittest.TestCase):
             block_time={9: 0},
             last_display_block=8,
             _sample_window_lock=threading.Lock(),
+            _spectrum_sample_rate_hz=80e6,
+            _spectrum_center_hz=2.4e9,
             _rx_sensor_ids=lambda: tuple(range(8)),
         )
 

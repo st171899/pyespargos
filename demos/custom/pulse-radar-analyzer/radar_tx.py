@@ -1,6 +1,7 @@
 """Hardware setup for the ESPARGOS pulse radar, using the IQ TX demo API."""
 
 import math
+import numpy as np
 import threading
 
 from espargos import Antenna
@@ -42,7 +43,7 @@ def configure_receivers(pool, config):
     """
     config = dict(config)
     if "mode" in config or "modes" in config:
-        raise ValueError("Change radar sensor roles in the Transmission tab")
+        raise ValueError("Change radar sensor roles in the app sidebar")
     settings = {key: config.pop(key) for key in ("rf_freq_hz", "gain_mode", "rx_gain", "expert_gain_words") if key in config}
     if settings and "receivers" in config:
         raise ValueError("Cannot combine receiver lists with array-wide RX settings")
@@ -117,6 +118,8 @@ class RadarTransmitter:
             raise ValueError("Unknown calibration method or path")
         if args.tx_calibration == "monitor" and args.calibration_path != "reference":
             raise ValueError("Monitor calibration requires the reference path")
+        from radar_waveform import replay_samples
+        replay_samples(vars(args), getattr(args, "samples", 256))
         center = round(args.frequency_mhz * 1e6)
         configs = _map(lambda b: b.iq.get_config(), self.pool.boards)
         # Avoid re-firing RX/TX on Start after a calibration. In particular,
@@ -171,34 +174,60 @@ class RadarTransmitter:
                 if config["modes"] != ["iq_rx"] * 8:
                     board.iq.set_config({"modes": ["iq_rx"] * 8})
 
-    def prepare(self, waveform, gain_db):
+    def prepare(self, waveform, gain_db, *, mute=True):
         """Prepare a muted replay without measuring or invalidating its timing."""
         if self.session is None:
-            raise ValueError("Choose transmit sensors in the Transmission tab")
+            raise ValueError("Choose transmit sensors in the app sidebar")
         amplitude = 10 ** (gain_db / 20)
         if not math.isfinite(amplitude) or not 0 < amplitude <= 1.0:
             raise ValueError("TX digital gain must be at most 0 dB (amplitude ≤ 1)")
-        source = IQSamples(waveform)
+        from demos.custom.common.iq_tx_waveform import synthesized_waveform
+
+        beams = getattr(self.args, "beams", None)
+        if not beams:
+            az, el = np.radians([self.args.tx_azimuth, self.args.tx_elevation])
+            beams = [dict(u=np.sin(az)*np.cos(el), v=np.sin(el), squint=self.args.tx_squint, amplitude=1)]
+        editor = getattr(self.args, "waveform_editor", False)
+        samples = getattr(self.args, "samples", 256)
+        from radar_waveform import replay_samples, prepare_source
+        hardware_samples = replay_samples(vars(self.args), samples)
+        sources = []
+        reference = None
+        for beam in beams:
+            if hasattr(self.args, "chirp_frames") and getattr(self.args, "beams", None):
+                from radar_waveform import beam_source
+                source = beam_source(beam, vars(self.args), samples)
+            else:
+                source = (IQSamples.from_file(beam["file"], normalize=True) if beam["type"] == "file" else synthesized_waveform(beam)) if editor else IQSamples(waveform)
+            source, native = prepare_source(source, vars(self.args), samples)
+            if reference is None:
+                reference = native
+            u, v = beam["u"], beam["v"]
+            az = float(np.degrees(np.arctan2(u, np.sqrt(max(0, 1-u*u-v*v)))))
+            el = float(np.degrees(np.arcsin(np.clip(v, -1, 1))))
+            sources.append(dict(waveform=source, amplitude=(beam["amplitude"] if getattr(self.args, "beams", None) else amplitude)/len(beams),
+                                antennas=self.antennas, steering=Beamspace(azimuth_deg=az, elevation_deg=el, squint=beam["squint"])))
         try:
-            self.session.mute(True)
-            with self.session.update(samples=256):
-                self.session.signals.clear()
-                self.session.signals.add(
-                    waveform=source,
-                    amplitude=amplitude,
-                    antennas=self.antennas,
-                    steering=Beamspace(azimuth_deg=self.args.tx_azimuth, elevation_deg=self.args.tx_elevation, squint=self.args.tx_squint),
-                )
+            if mute:
+                self.session.mute(True)
+            with self.session.update(samples=hardware_samples):
+                # Update existing signals so steering retains the replay origins.
+                while len(self.session.signals) > len(sources):
+                    self.session.signals[-1].remove()
+                for i, settings in enumerate(sources):
+                    if i < len(self.session.signals):
+                        self.session.signals[i].update(**settings)
+                    else:
+                        self.session.signals.add(**settings)
         except Exception:
             self.session.mute(True)
             raise
-        # One common quantized chirp; never use the per-sensor steering or
-        # calibration coefficients to correlate the receive channels.
-        return source.synthesize(256)
+        # Beam 1 supplies the common, unsteered receive correlation reference.
+        return reference
 
     def start(self, waveform, gain_db):
         """Start immediately; the central Sync + Calibration action measures TX/RX."""
-        reference = self.prepare(waveform, gain_db)
+        reference = self.prepare(waveform, gain_db, mute=False)
         self.session.mute(False)
         return reference
 
