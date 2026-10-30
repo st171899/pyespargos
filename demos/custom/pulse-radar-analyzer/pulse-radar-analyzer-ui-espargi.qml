@@ -49,6 +49,22 @@ Common.ESPARGOSApplication {
         ToolTip.text: "Enter meters. Snaps to the nearest received sample, keeping at least one sample in the observation interval."
     }
 
+    component RadarVelocityField: TextField {
+        required property bool upperBound
+        readonly property real value: upperBound ? backend.velocityMaximum : backend.velocityMinimum
+        Layout.fillWidth: true
+        selectByMouse: true
+        validator: DoubleValidator { locale: "C"; decimals: 9; notation: DoubleValidator.ScientificNotation }
+        function refresh() { text = value.toString(); }
+        onValueChanged: if (!activeFocus) refresh()
+        Component.onCompleted: refresh()
+        onEditingFinished: {
+            if (acceptableInput && text.trim().length > 0)
+                backend.setRadarVelocity(Number(text), upperBound);
+            refresh();
+        }
+    }
+
 	/** RX drawer: the reusable IQ capture settings (replaces the CSI pool drawer) **/
 	receiverDrawerComponent: Component {
 		IQ.IQRxDrawer {
@@ -86,6 +102,7 @@ Common.ESPARGOSApplication {
 
 			Label { text: "Mode"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			ComboBox {
+                objectName: "displayModeSelector"
 				property string configKey: "display_mode"
 				property string configProp: "currentValue"
 				Component.onCompleted: appDrawer.configManager.register(this)
@@ -99,16 +116,17 @@ Common.ESPARGOSApplication {
 					{ value: "time", text: "Time domain I/Q" },
 					{ value: "ping", text: "Ping TX / Time IQ" },
 					{ value: "constellation", text: "I/Q constellation" },
-					{ value: "spectrum", text: "Amplitude spectrum" },
 					{ value: "angle", text: "Ping angle of arrival" },
-					{ value: "radar", text: "2D Range-Azimuth Radar Map" }
+					{ value: "radar", text: "2D Range-Azimuth Radar Map" },
+                    { value: "doppler", text: "Range-Doppler (rectangular)" }
 				]
 				currentValue: "power"
 			}
 
-			Label { text: "FFT"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+			Label { visible: !backend.radarMode && !backend.angleMode; text: "FFT"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			ComboBox {
-				property string configKey: "fft_size"
+				visible: !backend.radarMode && !backend.angleMode
+                property string configKey: "fft_size"
 				property string configProp: "currentValue"
 				Component.onCompleted: appDrawer.configManager.register(this)
 				onCurrentValueChanged: appDrawer.configManager.onControlChanged(this)
@@ -116,12 +134,13 @@ Common.ESPARGOSApplication {
 				model: [256, 512, 1024]
 				currentIndex: 2
 				ToolTip.visible: hovered
-				ToolTip.text: "Samples per display update in every mode: one waterfall row, chart trace or constellation spans FFT/256 consecutive chunks, so the trigger must deliver contiguous runs of at least that many chunks (e.g. interval burst >= 4 for 1024)."
+				ToolTip.text: "Waterfall rows, chart traces and constellations span FFT/256 consecutive chunks (e.g. burst >= 4 for 1024). Doppler uses its observation time and works with burst=1; increasing this FFT size does not improve velocity resolution."
 			}
 
-			Label { text: "Use Calibration"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+			Label { visible: !backend.radarMode && !backend.angleMode; text: "Use Calibration"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			Switch {
-				property string configKey: "apply_calibration"
+				visible: !backend.radarMode && !backend.angleMode
+                property string configKey: "apply_calibration"
 				property string configProp: "checked"
 				Component.onCompleted: appDrawer.configManager.register(this)
 				onCheckedChanged: appDrawer.configManager.onControlChanged(this)
@@ -130,9 +149,10 @@ Common.ESPARGOSApplication {
 				ToolTip.text: "Apply the fine per-sensor time/phase calibration to the relative-phase display. No effect until a calibration has been run (drawer button or startup)."
 			}
 
-			Label { text: "Complete only"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
+			Label { visible: !backend.radarMode && !backend.angleMode; text: "Complete only"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 			Switch {
-				property string configKey: "complete_only"
+				visible: !backend.radarMode && !backend.angleMode
+                property string configKey: "complete_only"
 				property string configProp: "checked"
 				Component.onCompleted: appDrawer.configManager.register(this)
 				onCheckedChanged: appDrawer.configManager.onControlChanged(this)
@@ -152,7 +172,7 @@ Common.ESPARGOSApplication {
 				onCheckedChanged: appDrawer.configManager.onControlChanged(this)
 				checked: false
 				ToolTip.visible: hovered
-				ToolTip.text: "Subtract static background in Ping, Angle, and Radar modes. Manual: capture it with the button. Automatic: continuously learn recent acquisitions to emphasize moving targets."
+				ToolTip.text: "Subtract static background in Ping/time, angle of arrival, and both radar maps. Manual: capture it with the button. Automatic: continuously learn recent acquisitions to emphasize moving targets."
 			}
 
             Label { text: "Clutter mode"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
@@ -168,11 +188,12 @@ Common.ESPARGOSApplication {
                 valueRole: "value"
                 model: [
                     {value: "manual", text: "Manual (200 chunks)"},
-                    {value: "automatic", text: "Automatic (rolling)"}
+                    {value: "automatic", text: "Automatic (rolling)"},
+                    {value: "zero_doppler", text: "Zero Doppler (CPI mean)"}
                 ]
                 currentValue: "manual"
                 ToolTip.visible: hovered
-                ToolTip.text: "Automatic subtracts the previous 16 raw-IQ chunks, retaining at most 0.4 seconds of history. Stationary targets fade; slow motion may also be attenuated."
+                ToolTip.text: "Automatic subtracts the previous 16 raw-IQ chunks, retaining at most 0.4 seconds of history. Stationary targets fade; slow motion may also be attenuated. Zero Doppler subtracts the coherent IQ mean: up to 64 received chunks in Ping/time, angle of arrival, and range–angle, or the selected observation time in range–Doppler. Gaps do not reset the 64-chunk mean."
             }
 
 			// Empty label slot to align the action button onto the right side column layout
@@ -205,24 +226,74 @@ Common.ESPARGOSApplication {
 
 
 
-            Label { text: "Range start [m]"; Layout.alignment: Qt.AlignRight }
-            RadarRangeField { objectName: "radarMinRangeField"; upperBound: false }
-            Label { text: "Range end [m]"; Layout.alignment: Qt.AlignRight }
-            RadarRangeField { objectName: "radarMaxRangeField"; upperBound: true }
+            Label { visible: backend.radarMode; text: "Range start [m]"; Layout.alignment: Qt.AlignRight }
+            RadarRangeField { visible: backend.radarMode; objectName: "radarMinRangeField"; upperBound: false }
+            Label { visible: backend.radarMode; text: "Range end [m]"; Layout.alignment: Qt.AlignRight }
+            RadarRangeField { visible: backend.radarMode; objectName: "radarMaxRangeField"; upperBound: true }
             Label {
                 Layout.columnSpan: 2
                 Layout.fillWidth: true
+                visible: backend.radarMode
                 text: isFinite(backend.radarZeroSample)
-                    ? "Resolution: " + backend.radarMetersPerSample.toFixed(3) + " m/sample · applied samples " + backend.delayMin + "–" + backend.delayMax
+                    ? "Range grid: " + backend.radarMetersPerSample.toFixed(3) + " m/sample · applied samples " + backend.delayMin + "–" + backend.delayMax
                     : "Use Sync + Calibration to enter observation limits in meters."
                 color: "#9aa4b2"
                 font.pixelSize: 11
                 wrapMode: Text.Wrap
             }
 
-            Label { text: "Radar color scale"; Layout.alignment: Qt.AlignRight }
+            Label { visible: backend.dopplerMode; text: "Observation time"; Layout.alignment: Qt.AlignRight }
+            ComboBox {
+                objectName: "dopplerObservationSelector"
+                visible: backend.dopplerMode
+                property string configKey: "doppler_observation_ms"
+                property string configProp: "currentValue"
+                textRole: "text"; valueRole: "value"
+                model: [
+                    {value: 5, text: "5 ms"},
+                    {value: 10, text: "10 ms"},
+                    {value: 20, text: "20 ms"},
+                    {value: 25, text: "25 ms"},
+                    {value: 50, text: "50 ms"},
+                    {value: 100, text: "100 ms"},
+                    {value: 150, text: "150 ms"},
+                    {value: 250, text: "250 ms"},
+                    {value: 500, text: "500 ms"},
+                    {value: 1000, text: "1 s"},
+                    {value: 2000, text: "2 s"},
+                    {value: 5000, text: "5 s"}
+                ]
+                Component.onCompleted: appDrawer.configManager.register(this)
+                onCurrentValueChanged: appDrawer.configManager.onControlChanged(this)
+                ToolTip.visible: hovered
+                ToolTip.text: "Maximum age of samples combined coherently. A window shorter than the burst interval may contain only one burst and give poor velocity resolution. Longer observations separate closer velocities but smear changing targets. The velocity grid is chosen automatically from the acquired aperture and the limits below."
+            }
+            Label { visible: backend.dopplerMode; text: "Velocity start [m/s]"; Layout.alignment: Qt.AlignRight }
+            RadarVelocityField {
+                objectName: "dopplerMinVelocityField"
+                upperBound: false
+                visible: backend.dopplerMode
+            }
+            Label { visible: backend.dopplerMode; text: "Velocity end [m/s]"; Layout.alignment: Qt.AlignRight }
+            RadarVelocityField {
+                objectName: "dopplerMaxVelocityField"
+                upperBound: true
+                visible: backend.dopplerMode
+            }
+            Label {
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                visible: backend.radarMode
+                text: "Range controls apply to both maps. Velocity limits accept 9 decimal places; widening the plot does not resolve aliases."
+                wrapMode: Text.Wrap
+                font.pixelSize: 11
+                color: "#9aa4b2"
+            }
+
+            Label { visible: backend.radarMode; text: "Radar color scale"; Layout.alignment: Qt.AlignRight }
             ComboBox {
                 objectName: "radarScaleSelector"
+                visible: backend.radarMode
                 property string configKey: "radar_scale"
                 property string configProp: "currentIndex"
                 function encode(index) { return index === 1 ? "linear" : "db"; }
@@ -232,8 +303,9 @@ Common.ESPARGOSApplication {
                 onCurrentIndexChanged: appDrawer.configManager.onControlChanged(this)
             }
 
-            Label { text: "Color limits [dBFS]"; Layout.alignment: Qt.AlignRight }
+            Label { visible: backend.radarMode; text: "Color limits [dBFS]"; Layout.alignment: Qt.AlignRight }
             ColumnLayout {
+                visible: backend.radarMode
                 Layout.fillWidth: true
                 spacing: 0
                 RangeSlider {
@@ -314,7 +386,7 @@ Common.ESPARGOSApplication {
 		StackLayout {
 			Layout.fillWidth: true
 			Layout.fillHeight: true
-			currentIndex: backend.radarMode ? 2 : (backend.angleMode ? 1 : 0)
+			currentIndex: backend.dopplerMode ? 3 : (backend.radarMode ? 2 : (backend.angleMode ? 1 : 0))
 
 
 			// SCREEN 1: Multi-Antenna Waterfall/Chart Grid View
@@ -365,7 +437,7 @@ Common.ESPARGOSApplication {
 								Image {
 									id: displayImage
 									anchors.fill: parent
-									visible: !backend.timeDomain && !backend.constellation && !backend.spectrum && !backend.angleMode
+									visible: !backend.timeDomain && !backend.constellation && !backend.angleMode
 									fillMode: Image.Stretch
 									cache: false
 									smooth: false
@@ -373,7 +445,7 @@ Common.ESPARGOSApplication {
 
 									Timer {
 										interval: 1000 / 25
-										running: !backend.timeDomain && !backend.constellation && !backend.spectrum && !backend.angleMode
+										running: displayImage.visible
 										repeat: true
 										onTriggered: displayImage.source =
 											"image://display" + antennaPanel.antid + "?" + Date.now()
@@ -461,7 +533,7 @@ Common.ESPARGOSApplication {
 
 											Timer {
 												interval: 1000 / 25
-												running: true
+												running: timeChart.visible
 												repeat: true
 												onTriggered: {
 													const stats = backend.updateTimeChart(timeChart.antid, iTrace, qTrace, correlationTrace, correlationPeaks)
@@ -475,67 +547,6 @@ Common.ESPARGOSApplication {
 																}
 													}
 												}
-											}
-										}
-									}
-								}
-
-								Loader {
-									anchors.fill: parent
-									active: backend.spectrum
-									sourceComponent: Component {
-										ChartView {
-											id: spectrumChart
-											property int antid: antennaPanel.antid
-											legend.visible: false
-											antialiasing: true
-											backgroundColor: "#101014"
-											backgroundRoundness: 0
-											dropShadowEnabled: false
-											margins { top: 0; bottom: 0; left: 0; right: 0 }
-
-											ValueAxis {
-												id: spectrumFrequencyAxis
-												min: 2397
-												max: 2477
-												tickCount: 5
-												labelFormat: "%.1f"
-												labelsColor: "#9aa4b2"
-												labelsFont.pixelSize: 8
-												lineVisible: false
-												gridLineColor: "#37373b"
-												titleText: "<font color='#9aa4b2'>Frequency [MHz]</font>"
-												titleFont.pixelSize: 9
-											}
-
-											ValueAxis {
-												id: spectrumAmplitudeAxis
-												min: -90
-												max: 0
-												tickCount: 4
-												labelFormat: "%.0f"
-												labelsColor: "#9aa4b2"
-												labelsFont.pixelSize: 8
-												lineVisible: false
-												gridLineColor: "#37373b"
-												titleText: "<font color='#9aa4b2'>Amplitude [dBFS]</font>"
-												titleFont.pixelSize: 9
-											}
-
-											LineSeries {
-												id: spectrumLine
-												axisX: spectrumFrequencyAxis
-												axisY: spectrumAmplitudeAxis
-												color: window.antennaColor(spectrumChart.antid)
-												width: 1.25
-												useOpenGL: Qt.platform.os === "linux"
-											}
-
-											Timer {
-												interval: 1000 / 25
-												running: true
-												repeat: true
-												onTriggered: backend.updateSpectrumChart(spectrumChart.antid, spectrumLine, spectrumFrequencyAxis)
 											}
 										}
 									}
@@ -589,7 +600,7 @@ Common.ESPARGOSApplication {
 
 											Timer {
 												interval: 1000 / 25
-												running: true
+												running: constellationChart.visible
 												repeat: true
 												onTriggered: backend.updateConstellationChart(constellationChart.antid, constellationPoints)
 											}
@@ -728,7 +739,7 @@ Common.ESPARGOSApplication {
 
 						Timer {
 							interval: 100
-							running: true
+							running: angleChart.visible
 							repeat: true
 							onTriggered: backend.updateAngleChart(angleSpectrum)
 						}
@@ -770,7 +781,7 @@ Common.ESPARGOSApplication {
 		id: radarModeLoader
         Layout.fillWidth: true
         Layout.fillHeight: true
-		active: backend.radarMode
+		active: backend.radarMode && !backend.dopplerMode
 
 		sourceComponent: Component {
 			Rectangle {
@@ -799,50 +810,19 @@ Common.ESPARGOSApplication {
 
 						// Keep the source texture at the backend data resolution.
 						// ShaderEffectSource hides it from the window without fading it.
-						Canvas {
-							id: plotCanvas
-							// Bind dimensions directly to backend properties matching the working demo structure
-							width: backend.angleSize > 0 ? backend.angleSize : 256
-							height: backend.delaySize > 0 ? backend.delaySize : 256
+                        Image {
+                            id: plotCanvas
+                            objectName: "radarTexture"
+                            width: Math.max(1, backend.angleSize)
+                            height: Math.max(1, backend.delaySize)
+                            cache: false
+                            asynchronous: true
+                            // Loading a replacement must not blank the live shader.
+                            retainWhileLoading: true
+                            source: "image://radarmap/" + backend.radarFrame
+                        }
 
-							renderTarget: Canvas.Image
-							renderStrategy: Canvas.Immediate
-
-							property var imageData: undefined
-
-							function createImageData() {
-								if (!available || width <= 0 || height <= 0) return;
-                                // A deferred resize must not overwrite a newer received frame.
-                                if (imageData && imageData.width === width && imageData.height === height) return;
-								const ctx = plotCanvas.getContext("2d");
-								if (ctx) {
-									imageData = ctx.createImageData(width, height);
-									// Show the heatmap floor even before the first IQ frame.
-									for (let i = 0; i < imageData.data.length; i += 4) {
-										imageData.data[i] = 68;
-										imageData.data[i + 1] = 1;
-										imageData.data[i + 2] = 84;
-										imageData.data[i + 3] = 255;
-									}
-									requestPaint();
-								}
-							}
-
-							onAvailableChanged: if (available) createImageData();
-							onWidthChanged: if (available) createImageData();
-							onHeightChanged: if (available) createImageData();
-
-							onPaint: {
-								if (available && plotCanvas.imageData) {
-									const ctx = plotCanvas.getContext("2d");
-									if (ctx) {
-										ctx.drawImage(plotCanvas.imageData, 0, 0);
-									}
-								}
-							}
-						}
-
-						// Main Visual Panel (Fills container to properly share the bottom origin baseline)
+                        // Main Visual Panel (Fills container to properly share the bottom origin baseline)
 						Rectangle {
 							id: plotArea
 							anchors.fill: parent
@@ -1093,46 +1073,20 @@ Common.ESPARGOSApplication {
 					function onTxStateChanged() { gridOverlayCanvas.requestPaint(); }
                     function onRadarConfigChanged() {
 						gridOverlayCanvas.requestPaint();
-						Qt.callLater(function() { plotCanvas.createImageData(); });
 					}
 
-					function onRadarMapChanged(image_data) {
-						if (!image_data || image_data.length === 0) return;
-
-						// The backend emits exactly w*h RGBA values. Use the emitted
-						// dimensions, not a stale Canvas binding during a resize.
-						let w = Math.max(1, backend.angleSize);
-						let h = Math.max(1, backend.delaySize);
-						if (w <= 0 || h <= 0) return;
-
-						if (image_data.length !== w * h * 4) return;
-						if (plotCanvas.width !== w || plotCanvas.height !== h) {
-							plotCanvas.width = w;
-							plotCanvas.height = h;
-						}
-						if (plotCanvas.imageData === undefined || plotCanvas.imageData.data.length !== image_data.length) {
-							const ctx = plotCanvas.getContext("2d");
-							if (ctx && plotCanvas.available) {
-								plotCanvas.imageData = ctx.createImageData(w, h);
-							}
-						}
-
-						if (plotCanvas.imageData) {
-							let len = plotCanvas.imageData.data.length;
-							let copyLen = Math.min(len, image_data.length);
-							for (let i = 0; i < copyLen; i++) {
-								plotCanvas.imageData.data[i] = image_data[i];
-							}
-							plotCanvas.requestPaint();
-						}
-					}
 				}
 			}
 		}
 	}
+        Loader {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            active: backend.dopplerMode
+            sourceComponent: Component { DopplerPlot {} }
+        }
 
 	}
 }
 
 }
-

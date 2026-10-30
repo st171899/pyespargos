@@ -122,11 +122,21 @@ class RadarTransmitter:
         replay_samples(vars(args), getattr(args, "samples", 256))
         center = round(args.frequency_mhz * 1e6)
         configs = _map(lambda b: b.iq.get_config(), self.pool.boards)
+        # A TX-only board can retain a different ADC rate because the RX
+        # drawer correctly skips it. When it rejoins RX, use the rate of the
+        # first existing receiver that remains RX (or the first new receiver
+        # at startup). This demo calibrates all receiving boards together.
+        receiving_boards = [b for b in range(len(configs)) if self.receivers(b)]
+        rate_board = next((b for b in receiving_boards if any(
+            configs[b]["modes"][a] == "iq_rx" for a in self.receivers(b))), receiving_boards[0])
+        decimation = configs[rate_board]["adc_decimation"]
         # Avoid re-firing RX/TX on Start after a calibration. In particular,
         # rewriting every sensor through RX destroys the measured TX origins.
-        for board, config in zip(self.pool.boards, configs):
+        for bi, (board, config) in enumerate(zip(self.pool.boards, configs)):
             receivers = [dict(antid=a, rf_freq_hz=center) for a, r in enumerate(config["receivers"]) if r["rf_freq_hz"] != center]
             update = {"receivers": receivers} if receivers else {}
+            if bi in receiving_boards and config["adc_decimation"] != decimation:
+                update["adc_decimation"] = decimation
             if "wifi" in config["modes"]:
                 update["modes"] = ["iq_rx"] * 8
             if update:

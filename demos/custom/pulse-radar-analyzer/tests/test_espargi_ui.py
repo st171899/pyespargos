@@ -56,9 +56,14 @@ class TransmissionUITest(unittest.TestCase):
             self.assertIsNotNone(drawer)
             QMetaObject.invokeMethod(drawer, "open")
             pump()
+            modes = window.findChild(QObject, "displayModeSelector")
+            self.assertEqual(modes.property("count"), 8)
+            app._set_display_mode("time")
+            app._set_display_mode("spectrum")  # Old saved modes fall back to power.
+            self.assertEqual(app.display_mode, "power")
             board_tabs = window.findChild(QObject, "receiveBoardTabs")
             self.assertIsNotNone(board_tabs)
-            for mode in ("angle", "radar"):
+            for mode in ("angle", "radar", "doppler"):
                 app._set_display_mode(mode)
                 pump()
                 self.assertTrue(board_tabs.property("visible"))
@@ -69,6 +74,61 @@ class TransmissionUITest(unittest.TestCase):
                 board_tabs.setProperty("currentIndex", 0)
                 pump()
                 self.assertEqual(app.activeBoard, 0)
+            observation = window.findChild(QObject, "dopplerObservationSelector")
+            self.assertIsNotNone(observation)
+            observation.setProperty("currentIndex", 8)
+            pump()
+            self.assertEqual(app.appconfig.get("doppler_observation_ms"), 500)
+            self.assertIsNone(window.findChild(QObject, "dopplerHistorySelector"))
+            app.setRadarVelocity(-2.5, False)
+            app.setRadarVelocity(3.5, True)
+            self.assertEqual(app.velocityMinimum, -2.5)
+            self.assertEqual(app.velocityMaximum, 3.5)
+            fine_min = window.findChild(QObject, "dopplerMinVelocityField")
+            fine_max = window.findChild(QObject, "dopplerMaxVelocityField")
+            fine_min.setProperty("text", "-0.000123456")
+            self.assertTrue(fine_min.property("acceptableInput"))
+            QMetaObject.invokeMethod(fine_min, "editingFinished")
+            fine_max.setProperty("text", "-0.000123455")
+            self.assertTrue(fine_max.property("acceptableInput"))
+            QMetaObject.invokeMethod(fine_max, "editingFinished")
+            self.assertAlmostEqual(app.velocityMinimum, -0.000123456, places=12)
+            self.assertAlmostEqual(app.velocityMaximum, -0.000123455, places=12)
+            self.assertAlmostEqual(app.velocityMaximum-app.velocityMinimum, 1e-9, places=12)
+            app.setRadarVelocity(3.5, True)
+            app.setRadarVelocity(-2.5, False)
+            clutter = window.findChild(QObject, "clutterModeSelector")
+            clutter.setProperty("currentIndex", 2)
+            pump()
+            self.assertEqual(app.clutterMode, "zero_doppler")
+            # No reference must produce a clear empty map, never fake range/Doppler.
+            app._tx_waveform = None
+            app._angle_geometry = lambda: module.np.arange(8).reshape(2, 4)
+            frames = []
+            app.dopplerMapChanged.connect(frames.append)
+            app._doppler_last_render = 0
+            app._render_doppler()
+            self.assertEqual(len(frames), 1)
+            self.assertIn("Start ping transmission", app.dopplerProcessingInfo)
+            app.dopplerMapChanged.disconnect(frames.append)
+            app._set_display_mode("radar")
+            app.remove_los = True
+            static = {a: module.np.full(256, 100+30j, module.np.complex64) for a in range(8)}
+            # Actual display ingestion: starts are off the configured phase,
+            # and alternate gaps/missing starts must not reset the DC mean.
+            app._display_config = dict(trigger=dict(mode="interval", interval_chunks=8192, offset_chunks=0, burst_chunks=4))
+            sets = [(k*8192+17+k%2, {a: t for a, t in static.items() if a != k%8}) for k in range(12)]
+            app._render_block_rows(sets, "radar")
+            self.assertEqual(len(app._doppler.frames), 12)
+            radar_frames = []
+            app.radarMapChanged.connect(radar_frames.append)
+            app._radar_last_render_time = 0
+            app._publish_sample_windows(static)
+            rgba = module.np.asarray(radar_frames[-1]).reshape(-1, 4)
+            module.np.testing.assert_array_equal(rgba, module.np.tile([68, 1, 84, 255], (len(rgba), 1)))
+            app.radarMapChanged.disconnect(radar_frames.append)
+            app.remove_los = False
+
             scale = window.findChild(QObject, "radarScaleSelector")
             limits = window.findChild(QObject, "radarPowerRangeSlider")
             self.assertIsNotNone(scale)
@@ -173,7 +233,7 @@ class TransmissionUITest(unittest.TestCase):
             self.assertFalse(app.txActive)
             from radar_waveform import beam_source
             from demos.custom.common.iq_tx_plot import IQTxPlot
-            self.assertEqual(app.txcontrol.data["beams"][0]["amplitude"], 0.1)
+            self.assertEqual(app.txcontrol.data["beams"][0]["amplitude"], 10**(app.DEFAULT_CONFIG["tx_gain_db"]/20))
             app.txcontrol.setBeam(0, "amplitude", 0.25)
             self.assertAlmostEqual(app.txSettings["tx_gain_db"], 20*module.np.log10(0.25))
             app.setTxSetting("tx_gain_db", -20)

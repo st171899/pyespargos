@@ -12,4 +12,8 @@ if not exist "%QSB%" (
 "%QSB%" --glsl "300 es,120,150" --hlsl 50 --msl 12 -o "%DIR%fragment_shader.qsb" "%DIR%fragment_shader.frag"
 "%QSB%" --glsl "300 es,120,150" --hlsl 50 --msl 12 -o "%DIR%vertex_shader.qsb" "%DIR%vertex_shader.vert"
 
+"%QSB%" --glsl "300 es,120,150" --hlsl 50 --msl 12 -o "%DIR%doppler_rect.vert.qsb" "%DIR%doppler_rect.vert"
+
+"%QSB%" --glsl "300 es,120,150" --hlsl 50 --msl 12 -o "%DIR%doppler_rect.frag.qsb" "%DIR%doppler_rect.frag"
+
 endlocal

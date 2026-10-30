@@ -89,6 +89,9 @@ class ReceiveLivenessTest(unittest.TestCase):
 
     def backend(self, clusters):
         return SimpleNamespace(
+            _doppler=module.DopplerHistory(),
+            _doppler_indices={},
+            _radar_capture_meta={},
             _pending_lock=threading.Lock(),
             _pending_clusters=clusters,
             active_board=0,
@@ -108,6 +111,10 @@ class ReceiveLivenessTest(unittest.TestCase):
         cluster = object.__new__(IQAccumCluster)
         cluster.config_generation = np.full((2, 2, 4), generation, np.uint32)
         cluster.source_chunk_start = wire_index
+        cluster.source_chunk_end = wire_index + 8192
+        cluster.nominal_chunks = 8192
+        cluster._counts = np.full((2, 2, 4, 1), 8192)
+        cluster._coverage_hashes = np.ones((2, 2, 4, 1), np.uint32)
         cluster.chunk_index, cluster.vector_chunks, cluster.sample_rate_hz = index, 1, 80e6
         cluster.center_freq_hz = 2.4e9
         cluster._completion = np.zeros((2, 2, 4), bool)
@@ -122,6 +129,50 @@ class ReceiveLivenessTest(unittest.TestCase):
         sets = module.EspargosPulseRadarAnalyzer._drain_sets(backend)
         self.assertEqual(sets[0][0], (1 << 24) + 8192)
         self.assertEqual(set(sets[0][1]), set(range(8)))
+        self.assertEqual(backend._doppler_indices, {(1 << 24) + 8192: 8192})
+
+    def test_doppler_only_uses_lane_zero_with_matching_coverage(self):
+        cluster = self.cluster(0, 4, 8192, 8192)
+        cluster.vector_chunks = 4
+        cluster.nominal_chunks = 2048
+        cluster._counts = np.full((2, 2, 4, 4), 2048)
+        cluster._coverage_hashes = np.ones((2, 2, 4, 4), np.uint32)
+        cluster._section_completion = np.repeat(cluster._completion[..., None], 4, axis=-1)
+        cluster._sections = np.ones((2, 2, 4, 4, 256), np.complex64)
+        for incomplete in (False, True):
+            backend = self.backend([(time.monotonic() - 1, cluster)])
+            if incomplete:
+                cluster._counts[0, 0, 0, 0] -= 1
+            sets = module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+            self.assertEqual(len(sets), 4)  # Existing displays still get every lane.
+            self.assertEqual(backend._doppler_indices, {} if incomplete else {8192: 8192})
+            self.assertEqual(set(backend._radar_capture_meta), set(range(8192, 8196)))
+            for index, metadata in backend._radar_capture_meta.items():
+                self.assertEqual(metadata["count"], 2048)
+                self.assertEqual(metadata["step"], 1024)
+                self.assertEqual(metadata["capture"], 8192)
+                self.assertEqual(metadata["partial"], incomplete and index == 8192)
+
+    def test_all_interval_burst_chunks_retain_sample_metadata(self):
+        shape = (2, 2, 4)
+        completion = np.zeros(shape, bool)
+        completion[0] = True
+        indices = [0, 1, 2, 3, 2048, 2049, 2050, 2051]
+        clusters = []
+        for index in indices:
+            cluster = SimpleNamespace(chunk_index=index, completion=completion,
+                sync_info=np.full(shape, 11), flags=np.zeros(shape, int),
+                sample_rate_hz=np.full(shape, 80_000_000), center_freq_hz=np.full(shape, 2_400_000_000),
+                iq=np.ones((*shape, 256), np.complex64))
+            clusters.append((time.monotonic()-1, cluster))
+        backend = self.backend(clusters)
+        backend._display_epoch = ("raw", 11, 80_000_000, False)
+        backend._display_config = dict(trigger=dict(mode="interval", interval_chunks=2048, offset_chunks=0, burst_chunks=4))
+        sets = module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+        self.assertEqual([idx for idx, _ in sets], indices)
+        self.assertEqual(set(backend._radar_capture_meta), set(indices))
+        self.assertEqual(backend._doppler_indices, {0: 2048, 2048: 2048})
+        self.assertTrue(all(meta["count"] == 1 for meta in backend._radar_capture_meta.values()))
 
     def test_other_board_generation_does_not_reset_active_display(self):
         cluster = self.cluster(1, 900, 8192, 8192)

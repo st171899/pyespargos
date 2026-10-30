@@ -20,6 +20,83 @@ from espargos.iq_transmitter import IQTransmitter
 
 
 class CalibrationRecoveryTest(unittest.TestCase):
+    def test_mismatched_calibration_settings_identify_the_board_and_rate(self):
+        from espargos.pool import AntennaSelection
+        from espargos.calibration import Antenna
+        for frequency, decimation, expected in [(2400e6, 4, "RX 20 MSa/s"), (2450e6, 1, "2450 MHz")]:
+            with self.subTest(frequency=frequency, decimation=decimation):
+                boards = [Mock(host=host, api_version=(4, 0)) for host in ("rx", "former-tx")]
+                for bi, board in enumerate(boards):
+                    board.revision.antenna_id_to_row_col.side_effect = lambda a: divmod(a, 4)
+                    board.iq.get_config.return_value = dict(modes=["iq_rx"]*8,
+                        adc_decimation=decimation if bi else 1,
+                        receivers=[dict(rf_freq_hz=frequency if bi else 2400e6) for _ in range(8)])
+                owner = SimpleNamespace(_lock=nullcontext(), open=Mock(), boards=boards,
+                    _refresh_receivers=Mock(), calibrations=Mock(), iq=SimpleNamespace(boards=boards))
+                selection = AntennaSelection(owner, [Antenna(b.host, a) for b in boards for a in range(8)])
+                with patch("espargos.pool._rpc", return_value={}), self.assertRaises(ValueError) as raised:
+                    selection.calibrate()
+                self.assertIn("Selected IQ sensors require one frequency and RX sample rate", str(raised.exception))
+                self.assertIn("former-tx sensors", str(raised.exception))
+                self.assertIn(expected, str(raised.exception))
+                self.assertIn("RX 80 MSa/s", str(raised.exception))
+
+    def test_narrow_receive_filter_is_restored_when_reference_onset_fails(self):
+        for bandwidth in (0, 20, 40):
+            with self.subTest(bandwidth=bandwidth):
+                state = {"filter_bw_mhz": bandwidth, "config_generation": 7}
+                board = Mock()
+                board.iq.get_config.side_effect = lambda: dict(state)
+                board.iq.set_config.side_effect = lambda payload: state.update(payload)
+                board.iq.set_reference.side_effect = RuntimeError("reference unavailable")
+                scope = SimpleNamespace(active=[0], pairs=[(0, 0)], ids=[[0]])
+                receiver = SimpleNamespace(boards=[board], master_board=board)
+                with self.assertRaisesRegex(RuntimeError, "reference unavailable"):
+                    iq_reference.acquire_grid(receiver, 2400e6, scope=scope)
+                self.assertEqual(state["filter_bw_mhz"], bandwidth)
+                changes = [call.args[0] for call in board.iq.set_config.call_args_list]
+                self.assertEqual(changes, [{"filter_bw_mhz": 40}, {"filter_bw_mhz": 20}] if bandwidth == 20 else [])
+                board.unsubscribe_sensor_messages.assert_called_once()
+                board.control.command.assert_called_with("gate_iq_reference", {"open": True})
+
+    def test_monitor_preparation_omits_invalid_empty_transmitter_updates(self):
+        from espargos import reference_monitor
+        boards = [Mock(host="rx"), Mock(host="tx")]
+        for i, board in enumerate(boards):
+            board.iq.get_config.return_value = dict(modes=["iq_rx" if i == 0 else "iq_tx"]*8,
+                receivers=[dict(rf_freq_hz=2400e6) for _ in range(8)],
+                rf_switch=2, adc_decimation=1, trigger=dict(mode="interval"))
+        state = dict(muted=True, calibration=dict(phase_deg=[0.]*8, delay_samples=[0.]*8),
+            steering=dict(phase_deg=[0.]*8, delay_samples=[0.]*8), sensors=[dict(
+                antid=a, frequency_hz=2400e6, samples=256, rf_gain=dict(a=0,b=0),
+                bandwidth_mhz=20, output="antenna_r", amplitude=1) for a in range(8)])
+        monitor_config = dict(enabled=False, gain_mode="manual", frequency_hz=2400e6,
+            sample_rate_hz=80e6, gain=12, bandwidth_mhz=60, samples=4096,
+            interval_us=10000, offset_us=0)
+        commands = []
+        def rpc(board, command, payload=None):
+            if command == "get_iq_tx":
+                return state
+            if command == "get_iq_monitor":
+                return monitor_config
+            if payload is not None:
+                self.assertNotEqual(payload.get("transmitters"), [], "Firmware rejects empty TX updates")
+            commands.append((board.host, command, payload))
+            return {}
+        scope = SimpleNamespace(active=[0,1], ids=[list(range(8)),list(range(8))],
+            pairs=[(i,a) for i in range(2) for a in range(8)],
+            modes=lambda i, saved: ["iq_rx"]*8, apply_rx=Mock())
+        receiver = SimpleNamespace(boards=boards, master_board=boards[0], _calibrating=False,
+            _sync=Mock(side_effect=RuntimeError("stop after preparation")))
+        with patch.object(iq_tx_monitor_calibration, "_rpc", side_effect=rpc), patch.object(
+            iq_tx_monitor_calibration, "TXStatus"), patch.object(
+            iq_tx_monitor_calibration, "compute_reference_path_delays", return_value=np.zeros((2,2,4))), patch.object(
+            reference_monitor, "ReferenceMonitor"), self.assertRaisesRegex(RuntimeError, "stop after preparation"):
+            iq_tx_monitor_calibration.calibrate(receiver, scope=scope)
+        receiver._sync.assert_called_once()
+        self.assertTrue(any(host == "rx" and command == "set_iq_tx" and payload.get("modes")
+                            and "transmitters" not in payload for host,command,payload in commands))
+
     def test_timing_gain_validation_and_forwarding(self):
         from espargos.pool import AntennaSelection
         from espargos._iq_calibration import delay

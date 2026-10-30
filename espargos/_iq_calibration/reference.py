@@ -147,6 +147,7 @@ def acquire_grid(pool, center, timeout=3.0, scope=None, *, threshold=REFERENCE_T
     ready, snapshots, generations = {}, {}, {}
     changed = threading.Condition()
     subscriptions = []
+    widened_filters = []
 
     def receive(board_index, message):
         try:
@@ -179,6 +180,15 @@ def acquire_grid(pool, center, timeout=3.0, scope=None, *, threshold=REFERENCE_T
                 changed.wait(left)
 
     try:
+        # The gated broadband edge is not reliably detected through a narrow
+        # application LPF. Acquire the coarse grid at 40 MHz, then restore the
+        # requested filters before phase/delay fitting and independent validation.
+        for bi in scope.active:
+            board = pool.boards[bi]
+            bandwidth = board.iq.get_config().get("filter_bw_mhz", 0)
+            if 0 < bandwidth < 40:
+                widened_filters.append((board, bandwidth))
+                board.iq.set_config({"filter_bw_mhz": 40})
         for bi in scope.active:
             board = pool.boards[bi]
             subscriptions.append((board, board.subscribe_sensor_messages(IQ_CHUNK_TYPE_HEADER, lambda m, bi=bi: receive(bi, m))))
@@ -215,8 +225,11 @@ def acquire_grid(pool, center, timeout=3.0, scope=None, *, threshold=REFERENCE_T
         try:
             pool.master_board.control.command("gate_iq_reference", {"open": True})
         finally:
-            for board, handle in subscriptions:
-                board.unsubscribe_sensor_messages(handle)
+            try:
+                for board, handle in subscriptions:
+                    board.unsubscribe_sensor_messages(handle)
+            finally:
+                _map(lambda pair: pair[0].iq.set_config({"filter_bw_mhz": pair[1]}), widened_filters)
 
 
 def collect(pool, count=16, timeout=3.0, seqs=None, mask=None):

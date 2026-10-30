@@ -26,6 +26,7 @@ Analyzer = module.EspargosPulseRadarAnalyzer
 class RadarTXTest(unittest.TestCase):
     def test_failed_calibration_does_not_announce_success(self):
         backend = SimpleNamespace(
+            _doppler=module.DopplerHistory(),
             iqcontrol=SimpleNamespace(syncNeeded=True),
             block_acc={1: 'old'}, block_time={1: 0}, last_display_block=1,
             _pending_lock=threading.Lock(), _pending_clusters=['old'], angleChanged=Mock(),
@@ -232,6 +233,29 @@ class RadarTXTest(unittest.TestCase):
             board.control.post_json.return_value = "ok"
         pool.tx.read.return_value = [dict(steering=dict(phase_deg=[0] * 8, delay_samples=[0] * 8), sensors=[dict(frequency_hz=2380e6, rf_gain=dict(a=0, b=0), bandwidth_mhz=40, output="antenna_r", amplitude=1) for _ in range(8)]) for _ in range(2)]
         return RadarTransmitter(pool, args), pool
+
+    def test_tx_board_rejoining_rx_uses_existing_receiver_rate(self):
+        for old_mode in ("iq_tx", "iq_rx", "wifi"):
+            with self.subTest(old_mode=old_mode):
+                tx, pool = self.setup_tx([])
+                pool.boards[0].iq.get_config.return_value["adc_decimation"] = 4
+                pool.boards[1].iq.get_config.return_value.update(
+                    modes=[old_mode]*8, adc_decimation=1)
+                tx.configure()
+                payloads = [c.args[0] for c in pool.boards[1].iq.set_config.call_args_list]
+                self.assertIn({"adc_decimation": 4}, [
+                    {k: v for k, v in p.items() if k == "adc_decimation"} for p in payloads])
+                # Matching receivers are not restarted unnecessarily.
+                pool.boards[0].iq.set_config.assert_not_called()
+
+    def test_tx_only_board_keeps_its_unused_adc_rate(self):
+        tx, pool = self.setup_tx(["espargostx"])
+        pool.boards[0].iq.get_config.return_value["adc_decimation"] = 4
+        pool.boards[1].iq.get_config.return_value.update(modes=["iq_tx"]*8, adc_decimation=1)
+        tx.configure()
+        for board in pool.boards:
+            for call in board.iq.set_config.call_args_list:
+                self.assertNotIn("adc_decimation", call.args[0])
 
     def test_receive_drawer_preserves_tx_on_mixed_and_tx_only_boards(self):
         tx, pool = self.setup_tx(["espargostx", "espargosrx.3"])
@@ -543,6 +567,8 @@ class RadarTXTest(unittest.TestCase):
         tone = np.exp(2j * np.pi * 7 * np.arange(256) / 256)
         backend = SimpleNamespace(
             fft_size=256,
+            display_mode="phase",
+            _radar_capture_meta={},
             _display_config={},
             _display_schedule=None,
             _clutter_calibrating=False,

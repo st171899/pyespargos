@@ -114,6 +114,15 @@ class WaterfallImageProvider(PyQt6.QtQuick.QQuickImageProvider):
             ).copy()
         return image, image.size()
 
+    def set_frame(self, pixels: np.ndarray):
+        """Replace a complete native RGBA texture without Python/QML pixel lists."""
+        pixels = np.ascontiguousarray(pixels, dtype=np.uint8)
+        if pixels.ndim != 3 or pixels.shape[2] != 4:
+            raise ValueError("Expected height × width × RGBA image")
+        with self.lock:
+            self.data = pixels.copy()
+            self.height, self.width = pixels.shape[:2]
+
     def add_rows(self, rows: np.ndarray):
         """Append chronological rows, displaying the newest row at the top."""
         rows = np.asarray(rows, dtype=np.uint8)

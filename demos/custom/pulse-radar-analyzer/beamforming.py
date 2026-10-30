@@ -27,7 +27,8 @@ def horizontal_power(samples, frequency_hz, spacing_m, bins=256):
     u = np.linspace(-1.0, 1.0, bins)
     phase = 2 * np.pi * frequency_hz * spacing_m / SPEED_OF_LIGHT
     weights = np.exp(-1j * phase * u[:, None] * np.arange(columns))
-    beams = np.einsum("bc,rct->rbt", weights, samples, optimize=True)
+    # Tiny spatial dimension: avoid launching a BLAS thread team per map.
+    beams = np.einsum("bc,rct->rbt", weights, samples, optimize=False)
     return np.sum(np.abs(beams) ** 2, axis=0)
 
 

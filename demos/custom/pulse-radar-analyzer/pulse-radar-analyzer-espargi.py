@@ -33,13 +33,16 @@ from demos.custom.common.iq_waterfall import WaterfallImageProvider, power_db_ro
 from radar_tx import RadarTransmitter, configure_receivers, calibrate_radar_timing
 from beamforming import AZIMUTH_DEG, ELEVATION_DEG, planar_power, horizontal_power
 from clutter import RollingClutter
+from doppler import DopplerHistory
+from range_doppler import SampleRadar, minimal_replay
+from radar_signal import resample_replay
 from radar_signal import chirp_reference, local_geometry, matched_filter_peaks
 
 DISPLAY_SETTLE_SECONDS = 0.2
 WATERFALL_HEIGHT = 300
 ADC_FULL_SCALE = 512.0
 DB_MIN, DB_MAX = -90.0, 0.0
-AMPLITUDE_TARGET = 2**14
+DISPLAY_MODES = ("power", "phase", "time", "ping", "constellation", "angle", "radar", "doppler")
 
 PHASE_MAPPER = matplotlib.cm.ScalarMappable(norm=matplotlib.colors.Normalize(vmin=-np.pi, vmax=np.pi, clip=True), cmap="twilight")
 
@@ -60,6 +63,41 @@ def pool_complex_to_width(z, w):
     return z[..., (np.arange(w) * n) // w]
 
 
+def spatial_samples(traces, geometry):
+    """Arrange antenna traces on the physical grid, zero-filling unused cells."""
+    samples = np.zeros((*geometry.shape, traces.shape[-1]), dtype=np.complex64)
+    valid = (geometry >= 0) & (geometry < traces.shape[0])
+    samples[valid] = traces[geometry[valid]]
+    return samples
+
+
+def power_pixels(power, lower, upper, linear=False):
+    """Apply the shared radar/Doppler color scale to normalized power."""
+    upper = upper if upper > lower else lower + 1
+    if linear:
+        low, high = 10**(lower/10), 10**(upper/10)
+        normalized = (power-low)/(high-low)
+    else:
+        normalized = (10*np.log10(np.maximum(power, 1e-12))-lower)/(upper-lower)
+    return (matplotlib.colormaps["viridis"](np.clip(normalized, 0, 1))*255).astype(np.uint8)
+
+
+def publish_map(backend, pixels, doppler=False):
+    """Publish one latest-frame texture; list signals serve Python diagnostics only."""
+    name = "doppler" if doppler else "radar"
+    provider = getattr(backend, "_" + name + "_image", None)
+    signal = backend.dopplerMapChanged if doppler else backend.radarMapChanged
+    if provider is not None:
+        provider.set_frame(pixels)
+        setattr(backend, "_" + name + "_frame", getattr(backend, "_" + name + "_frame") + 1)
+        (backend.dopplerFrameChanged if doppler else backend.radarFrameChanged).emit()
+        # No per-pixel QVariant serialization in the application UI.
+        if backend.receivers(signal):
+            signal.emit(pixels.reshape(-1).tolist())
+    else:
+        signal.emit(pixels.reshape(-1).tolist())
+
+
 class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     waterfallFrameReady = PyQt6.QtCore.pyqtSignal()
     displayModeChanged = PyQt6.QtCore.pyqtSignal()
@@ -69,20 +107,27 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     txOperationDone = PyQt6.QtCore.pyqtSignal(object)
     radarCalibrationDone = PyQt6.QtCore.pyqtSignal(object)
     txStateChanged = PyQt6.QtCore.pyqtSignal()
+    dopplerMapChanged = PyQt6.QtCore.pyqtSignal(list)
     radarMapChanged = PyQt6.QtCore.pyqtSignal(list)
+    radarFrameChanged = PyQt6.QtCore.pyqtSignal()
+    dopplerFrameChanged = PyQt6.QtCore.pyqtSignal()
     radarConfigChanged = PyQt6.QtCore.pyqtSignal()
     radarStatusChanged = PyQt6.QtCore.pyqtSignal()
 
+    PING_TX_DEFAULTS = {
+        "chirp_frames": 16,
+        "bandwidth_hz": 40e6,
+        "fs_hz": 80e6,
+        "pings_per_256": 1,
+        "tx_gain_db": 0,
+    }
+
     DEFAULT_CONFIG = {
+        **PING_TX_DEFAULTS,
         "display_mode": "power",
         "fft_size": 1024,
         "complete_only": False,
         "apply_calibration": True,
-        "chirp_frames": 16,
-        "bandwidth_hz": 40e6,
-        "fs_hz": 80e6,
-        "pings_per_256": 2,
-        "tx_gain_db": -20,
         "remove_los": False,
         "clutter_mode": "manual",
         "delay_min": 0,
@@ -90,15 +135,9 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         "radar_min_db": -50,
         "radar_max_db": 0,
         "radar_scale": "db",
-    }
-
-    # --- ping TX config ---
-    PING_TX_DEFAULTS = {
-        "chirp_frames": 16,
-        "bandwidth_hz": 40e6,
-        "fs_hz": 80e6,
-        "pings_per_256": 2,
-        "tx_gain_db": -20,
+        "doppler_observation_ms": 250,
+        "velocity_min": -5.0,
+        "velocity_max": 5.0,
     }
 
     clutterStatusChanged = PyQt6.QtCore.pyqtSignal()
@@ -157,7 +196,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._display_schedule = None
         self._display_epoch = None
         self._display_epoch_time = -1.0
-        self.display_mode = self.get_initial_config("app", "display_mode")
+        mode = self.get_initial_config("app", "display_mode")
+        self.display_mode = mode if mode in DISPLAY_MODES else "power"
         self.fft_size = int(self.get_initial_config("app", "fft_size"))
         self.complete_only = bool(self.get_initial_config("app", "complete_only"))
         self.display_width = CHUNK_SAMPLES
@@ -175,10 +215,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._sample_window_generation = 0
         self._time_trace_consumed = [-1] * SENSOR_COUNT
         self._constellation_consumed = [-1] * SENSOR_COUNT
-        self._spectrum_consumed = [-1] * SENSOR_COUNT
         self._spectrum_sample_rate_hz = DECIM_TO_FS[1]
-        self._spectrum_center_hz = 2437e6
-        self._spectrum_config_read_at = 0.0
+        self._spectrum_center_hz = 2400e6
         self._startup_abort_seconds = 20.0
         self._startup_abort_timer = PyQt6.QtCore.QTimer(self)
         self._startup_abort_timer.setSingleShot(True)
@@ -193,6 +231,14 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._radar_angle_size = 256
         self._radar_delay_size = 256
         self._radar_last_render_time = 0.0
+        self._doppler = DopplerHistory(int(self.appconfig.get("doppler_history") or 64), uniform=False)
+        self._doppler_indices = {}
+        self._sample_radar = SampleRadar(1024)
+        self._radar_capture_meta = {}
+        self._doppler_info = "Waiting for IQ and a transmit reference."
+        self._doppler_velocity = np.zeros(0)
+        self._doppler_last_render = 0.0
+        self._doppler_dirty = True
         self._clutter_lock = threading.Lock()
         self._automatic_clutter = RollingClutter()
         self._clutter_mode = str(self.appconfig.get("clutter_mode") or "manual")
@@ -205,6 +251,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._clutter_reference = {}
         self._clutter_status_text = "Clutter removal: Inactive"
 
+        self._radar_image = WaterfallImageProvider(256, 256)
+        self._doppler_image = WaterfallImageProvider(256, 256)
+        self._radar_frame = self._doppler_frame = 0
+        self.engine.addImageProvider("radarmap", self._radar_image)
+        self.engine.addImageProvider("dopplermap", self._doppler_image)
         self.providers = [WaterfallImageProvider(CHUNK_SAMPLES, WATERFALL_HEIGHT) for _ in range(SENSOR_COUNT)]
         for antid in range(SENSOR_COUNT):
             self.engine.addImageProvider(f"display{antid}", self.providers[antid])
@@ -235,7 +286,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self.complete_only = bool(newcfg["complete_only"])
         if "clutter_mode" in newcfg:
             mode = str(newcfg["clutter_mode"])
-            if mode in ("manual", "automatic") and mode != self._clutter_mode:
+            if mode in ("manual", "automatic", "zero_doppler") and mode != self._clutter_mode:
                 self._clutter_mode = mode
                 self._reset_clutter()
         if "remove_los" in newcfg:
@@ -243,10 +294,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if "apply_calibration" in newcfg:
             if self.iqcontrol is not None:
                 self.iqcontrol.set_apply_calibration(bool(newcfg["apply_calibration"]))
-        if any(key in newcfg for key in ("delay_min", "delay_max", "radar_min_db", "radar_max_db", "radar_scale")):
+        if any(key in newcfg for key in ("delay_min", "delay_max", "radar_min_db", "radar_max_db", "radar_scale", "velocity_min", "velocity_max", "doppler_observation_ms")):
+            self._doppler_dirty = True
             self.radarConfigChanged.emit()
 
     def _on_iq_calibration_changed(self):
+        self._doppler.clear()
+        if hasattr(self, "_sample_radar"):
+            self._sample_radar.clear()
+            self._doppler_dirty = True
         self.block_acc.clear()
         self.block_time.clear()
         self.last_display_block = -1
@@ -260,14 +316,20 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.angleChanged.emit()
 
     def _set_display_mode(self, mode):
+        mode = mode if mode in DISPLAY_MODES else "power"
         if mode != self.display_mode:
+            self._doppler.clear()
+            if hasattr(self, "_sample_radar"):
+                self._sample_radar.clear()
+                self._doppler_dirty = True
+            self._doppler_velocity = np.zeros(0)
             self.display_mode = mode
             self.block_acc.clear()
             self.block_time.clear()
             self.last_display_block = -1
             for p in self.providers:
                 p.clear()
-            if mode in ("time", "ping", "constellation", "spectrum", "angle", "radar"):
+            if mode in ("time", "ping", "constellation", "angle", "radar"):
                 self._publish_sample_windows({})
             self.waterfallFrameReady.emit()
             self.displayModeChanged.emit()
@@ -296,7 +358,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._clutter_collected_blocks = 0
             self._clutter_buffer = {}
             self._clutter_reference = {}
-            self._clutter_status_text = "Clutter removal: Inactive" if not self._remove_los else "Automatic clutter: 16 chunks / 0.4 s; waiting for IQ" if self._clutter_mode == "automatic" else "Manual clutter: press Calibrate Clutter (200 chunks)"
+            self._clutter_status_text = "Clutter removal: Inactive" if not self._remove_los else "Automatic clutter: 16 chunks / 0.4 s; waiting for IQ" if self._clutter_mode == "automatic" else "Zero Doppler: subtract coherent-window mean" if self._clutter_mode == "zero_doppler" else "Manual clutter: press Calibrate Clutter (200 chunks)"
+        if hasattr(self, "_doppler"):
+            self._doppler.clear()
+            if hasattr(self, "_sample_radar"):
+                self._sample_radar.clear()
+                self._doppler_dirty = True
         # Buffered display chunks may already contain automatic residuals.
         self.block_acc.clear()
         self.block_time.clear()
@@ -316,13 +383,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._reset_clutter()
         with self._clutter_lock:
             self._clutter_calibrating = True
-            self._clutter_calibrated = False
-            self._clutter_collected_blocks = 0
-            self._clutter_target_blocks = 200
-            self._clutter_buffer = {antid: [] for antid in range(SENSOR_COUNT)}
-            self._clutter_reference = {}
+            self._clutter_buffer = {antid: [] for antid in self._rx_sensor_ids()}
             self._clutter_status_text = "Calibrating clutter..."
-            self._remove_los = True
         if hasattr(self, "appconfig"):
             self.appconfig.set({"remove_los": True, "clutter_mode": "manual"})
         self.clutterStatusChanged.emit()
@@ -392,8 +454,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """
         if not raw_traces or not self._remove_los:
             return raw_traces
-        if getattr(self, "_clutter_mode", "manual") == "automatic":
-            return raw_traces  # Already cancelled once in _render_block_rows.
+        if getattr(self, "_clutter_mode", "manual") in ("automatic", "zero_doppler"):
+            return raw_traces  # Rolling: ingestion; zero Doppler: display publication.
         with self._clutter_lock:
             if self._clutter_calibrating or not self._clutter_calibrated:
                 return raw_traces
@@ -409,6 +471,140 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             repeated_reference = np.resize(reference, trace.size)
             cleaned[antenna_id] = (trace - repeated_reference).astype(np.complex64)
         return cleaned
+
+    def _append_doppler(self, index, traces, stride):
+        expected = self._rx_sensor_ids()
+        if not expected or not traces:
+            return
+        if self.remove_los and self._clutter_mode == "manual":
+            traces = self._cancel_line_of_sight(traces)
+        missing = np.full(CHUNK_SAMPLES, np.nan+1j*np.nan, np.complex64)
+        self._doppler.append(index, np.stack([traces.get(a, missing) for a in expected]), stride)
+
+    @PyQt6.QtCore.pyqtProperty(int, notify=radarFrameChanged)
+    def radarFrame(self):
+        return self._radar_frame
+
+    @PyQt6.QtCore.pyqtProperty(int, notify=dopplerFrameChanged)
+    def dopplerFrame(self):
+        return self._doppler_frame
+
+    @PyQt6.QtCore.pyqtProperty(bool, notify=displayModeChanged)
+    def dopplerMode(self):
+        return self.display_mode == "doppler"
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def velocityMinimum(self):
+        return float(self.appconfig.get("velocity_min") if self.appconfig.get("velocity_min") is not None else -5)
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def velocityMaximum(self):
+        return max(float(np.nextafter(self.velocityMinimum, np.inf)), float(self.appconfig.get("velocity_max") if self.appconfig.get("velocity_max") is not None else 5))
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def dopplerDataMinimum(self):
+        return float(self._doppler_velocity[0]) if self._doppler_velocity.size else -5.0
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def dopplerDataMaximum(self):
+        return float(self._doppler_velocity[-1]) if self._doppler_velocity.size else 5.0
+
+    @PyQt6.QtCore.pyqtSlot(float, bool)
+    def setRadarVelocity(self, velocity, upper):
+        if np.isfinite(velocity) and (velocity > self.velocityMinimum if upper else velocity < self.velocityMaximum):
+            self.appconfig.set({"velocity_max" if upper else "velocity_min": float(velocity)})
+            self._doppler_dirty = True
+            self.radarConfigChanged.emit()
+
+    @PyQt6.QtCore.pyqtSlot(float)
+    def setDopplerVelocitySpan(self, span):
+        if np.isfinite(span) and span > 0:
+            self.appconfig.set({"velocity_min": -float(span), "velocity_max": float(span)})
+            self._doppler_dirty = True
+            self.radarConfigChanged.emit()
+
+    def _render_doppler(self):
+        now = time.monotonic()
+        if not self._doppler_dirty or now-self._doppler_last_render < 0.2:
+            return
+        self._doppler_last_render = now
+        self._doppler_dirty = False
+        if self._tx_waveform is None:
+            self._show_doppler_error("Start ping transmission to calculate range and Doppler. Raw IQ without a transmit reference is not a range–velocity measurement.")
+            return
+        self._render_sample_radar()
+        self._doppler_last_render = time.monotonic()  # Rest between expensive frames.
+
+    @PyQt6.QtCore.pyqtProperty(str, notify=radarConfigChanged)
+    def dopplerProcessingInfo(self):
+        return self._doppler_info
+
+    def _show_doppler_error(self, message):
+        self._doppler_info = message
+        self._radar_status = "Doppler search needs different settings."
+        floor = np.empty((self.delaySize, self.angleSize, 4), np.uint8)
+        floor[:] = (68, 1, 84, 255)
+        self.radarConfigChanged.emit()
+        self.radarStatusChanged.emit()
+        publish_map(self, floor, True)
+
+    def _render_sample_radar(self):
+        if not self._sample_radar.records:
+            self._doppler_info = "Waiting for sample-timestamp data."
+            # Keep the previous texture while the next observation fills.
+            self.radarConfigChanged.emit()
+            self._radar_status = "Waiting for valid IQ chunks. Incomplete accumulated lanes are discarded; use Interval capture to retain motion information."
+            self.radarStatusChanged.emit()
+            return
+        cfg = self._reference_ping_config()
+        rate, frequency = self._spectrum_sample_rate_hz, self._spectrum_center_hz
+        try:
+            reference = minimal_replay(resample_replay(self._tx_waveform, cfg.get("fs_hz", 80e6), rate))
+        except ValueError as error:
+            self._show_doppler_error(str(error))
+            return
+        max_age = max(.005, min(5., float(self._ping_config_value("doppler_observation_ms", 250))/1000))
+        aperture = self._sample_radar.aperture_seconds(rate, max_age)
+        desired_step = espargos.constants.SPEED_OF_LIGHT/(4*frequency*max(aperture, 1/rate))
+        wanted = int(np.ceil((self.velocityMaximum-self.velocityMinimum)/desired_step))+1
+        bins = min(513, max(129, (1 << max(0, wanted-2).bit_length())+1))
+        velocity = np.linspace(self.velocityMinimum, self.velocityMaximum, bins)
+        lo, hi = self._radar_delay_bounds()
+        geometry = self._angle_geometry()
+        snapshot = (self.display_mode, self.velocityMinimum, self.velocityMaximum,
+                    self.delayMin, self.delayMax, self._ping_config_value("doppler_observation_ms", 250))
+        def cancelled():
+            return snapshot != (self.display_mode, self.velocityMinimum, self.velocityMaximum,
+                                self.delayMin, self.delayMax, self._ping_config_value("doppler_observation_ms", 250)) or not self._sample_radar.records or getattr(self, "_shutting_down", False)
+        try:
+            result = self._sample_radar.maps(reference, rate, frequency, velocity, np.arange(lo, hi), geometry,
+                mode="coherent", window="hann", spacing_m=espargos.constants.ANTENNA_SEPARATION,
+                suppress=self.remove_los and self._clutter_mode == "zero_doppler",
+                compensate=False, max_age=max_age, cancelled=cancelled)
+        except ValueError as error:
+            self._show_doppler_error(str(error))
+            return
+        if result is None:
+            return
+        full_scale = max(float(np.sum(np.count_nonzero(geometry >= 0, axis=1)**2))*ADC_FULL_SCALE**2, 1e-12)
+        values = result.power.T/full_scale
+        pixels = power_pixels(values, self.radarMinDb, max(self.radarMinDb + 1, self.radarMaxDb), self.radarLinearScale)
+        self._doppler_velocity = velocity
+        self._radar_angle_size, self._radar_delay_size = bins, hi-lo
+        dv = espargos.constants.SPEED_OF_LIGHT/(2*frequency*max(result.coherent_s, 1/rate))
+        step = float(velocity[1]-velocity[0])
+        self._radar_status = f"Coherent Doppler · {result.aperture_s*1000:.4g} ms acquired · Δv ≈ {dv:.4g} m/s · grid {step:.4g} m/s"
+        aliases = self._sample_radar.alias_spacing(rate, frequency, max_age)
+        details = (f"Capture-gap aliases ≈ {aliases:.4g} m/s apart; no guaranteed unambiguous band."
+                   if aliases is not None else "No guaranteed unambiguous band from these captures.")
+        if step > dv:
+            details += " Narrow limits for a finer grid."
+        if result.minimum_response < 1e-6:
+            details += " Averaging nulls hide some velocities."
+        self._doppler_info = details
+        self.radarConfigChanged.emit()
+        self.radarStatusChanged.emit()
+        publish_map(self, pixels, True)
 
     def _render_radar_heatmap(self, traces):
         """Render available samples, using calibration and matched filtering when available."""
@@ -434,19 +630,13 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         s_min, s_max = EspargosPulseRadarAnalyzer._radar_delay_bounds(self, sample_count, burst_length)
 
         sliced_traces2d = corrected[:, s_min:s_max]
-        sliced_traces = sliced_traces2d.shape[1]
 
         geometry = self._angle_geometry()
         row_count, column_count = geometry.shape
         if row_count == 0 or column_count == 0:
             return
 
-        spatial_samples = np.zeros((row_count, column_count, sliced_traces), dtype=np.complex64)
-        for row in range(row_count):
-            for column in range(column_count):
-                antenna_id = int(geometry[row, column])
-                if 0 <= antenna_id < sliced_traces2d.shape[0]:
-                    spatial_samples[row, column] = sliced_traces2d[antenna_id]
+        samples = spatial_samples(sliced_traces2d, geometry)
 
         # Matched-filter output is scaled by chirp energy. Divide by the RMS
         # correlation gain to recover received-IQ amplitude before dBFS.
@@ -457,12 +647,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             matched_energy = float(np.vdot(tx_reference, tx_reference).real)
             matched_gain = np.sqrt(matched_energy * chirp_length)
             if matched_gain > 1e-12:
-                spatial_samples /= matched_gain
+                samples /= matched_gain
 
         # RX steering scans candidate directions independently of the TX beam.
         # The shader expects uniform horizontal direction-cosine bins. The
         # actual RF wavelength matters: a raw FFT assumes d = wavelength/2.
-        power_map = horizontal_power(spatial_samples, getattr(self, "_spectrum_center_hz", 2437e6), espargos.constants.ANTENNA_SEPARATION)
+        power_map = horizontal_power(samples, getattr(self, "_spectrum_center_hz", 2400e6), espargos.constants.ANTENNA_SEPARATION)
 
         # fft() is unnormalized and antennas add coherently by row. Normalize
         # against each configured row's maximum coherent full-scale gain so a
@@ -470,22 +660,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # than saturating every pixel regardless of the selected color limits.
         active_per_row = np.count_nonzero(geometry >= 0, axis=1).astype(np.float64)
         reference_power = max(float(np.sum(active_per_row**2)) * ADC_FULL_SCALE**2, 1e-12)
-        power_db = 10.0 * np.log10(np.maximum(power_map / reference_power, 1e-12))
         configured_min = self.appconfig.get("radar_min_db") if hasattr(self, "appconfig") else None
         configured_max = self.appconfig.get("radar_max_db") if hasattr(self, "appconfig") else None
         display_min_db = float(-50 if configured_min is None else configured_min)
         display_max_db = float(0 if configured_max is None else configured_max)
-        if display_max_db <= display_min_db:
-            display_max_db = display_min_db + 1.0
-        if hasattr(self, "appconfig") and self.appconfig.get("radar_scale") == "linear":
-            lower, upper = 10 ** (display_min_db / 10), 10 ** (display_max_db / 10)
-            norm_map = np.clip((power_map / reference_power - lower) / (upper - lower), 0.0, 1.0)
-        else:
-            norm_map = np.clip((power_db - display_min_db) / (display_max_db - display_min_db), 0.0, 1.0)
-
-        colormap = matplotlib.colormaps.get_cmap("viridis")
-        color_data = colormap(np.transpose(norm_map))
-        np_data = (color_data * 255).astype(np.uint8)
+        linear = hasattr(self, "appconfig") and self.appconfig.get("radar_scale") == "linear"
+        np_data = power_pixels(power_map.T / reference_power, display_min_db, display_max_db, linear)
 
         # Expose the texture dimensions to QML.
         dimensions = (int(np_data.shape[1]), int(np_data.shape[0]))
@@ -502,8 +682,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.radarStatusChanged.emit()
 
         # QML reads the current angleSize and delaySize before uploading RGBA.
-        image_vector = np_data.flatten().tolist()
-        self.radarMapChanged.emit(image_vector)
+        publish_map(self, np_data)
 
     def _radar_delay_bounds(self, sample_count=None, burst_length=None):
         """Return the effective UI delay range limited to one pulse period."""
@@ -582,16 +761,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._angle_status = "IQ sample window is empty."
             self.angleChanged.emit()
             return
-        spatial_samples = np.zeros((row_count, column_count, sample_count), dtype=np.complex64)
-        for row in range(row_count):
-            for column in range(column_count):
-                antenna_id = geometry[row, column]
-                if 0 <= antenna_id < corrected.shape[0]:
-                    spatial_samples[row, column] = corrected[antenna_id]
+        samples = spatial_samples(corrected, geometry)
 
         # Conventional delay-and-sum response (ATWC Lecture 4, Eqs. 4.1–4.2).
         # Evaluate the spatial DTFT directly at physical look directions.
-        power_2d = planar_power(spatial_samples, self._spectrum_center_hz, espargos.constants.ANTENNA_SEPARATION)
+        power_2d = planar_power(samples, self._spectrum_center_hz, espargos.constants.ANTENNA_SEPARATION)
         if np.max(power_2d) <= 1e-12:
             self._angle_estimate_deg = float("nan")
             self._elevation_estimate_deg = float("nan")
@@ -627,7 +801,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.traceSampleCountChanged.emit()
 
     def _ping_config_value(self, key, default):
-        value = self.appconfig.get(key, default)
+        value = self.appconfig.get(key)
         return default if value is None else value
 
     def _current_ping_config(self):
@@ -664,12 +838,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         peaks = matched_filter_peaks(received, reference, correlation)
         return correlation, plotted_correlation, peaks
 
-    def _angle_matched_trace(self, iq):
+    def _angle_matched_trace(self, iq, reference=None):
         """Return complex matched-filter output for the active chirp."""
         if self._tx_waveform is None:
             return np.asarray(iq, dtype=np.complex64)
-        config = self._reference_ping_config()
-        reference, _ = receive_chirp_reference(self._tx_waveform, config, getattr(self, "_spectrum_sample_rate_hz", 80e6))
+        if reference is None:
+            reference, _ = receive_chirp_reference(self._tx_waveform, self._reference_ping_config(), getattr(self, "_spectrum_sample_rate_hz", 80e6))
         received = np.asarray(iq, dtype=np.complex64)
         if reference.size == 0 or received.size == 0:
             return received
@@ -873,6 +1047,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _finish_tx_operation(self, outcome):
         result, error = outcome
+        for name in ("_doppler", "_sample_radar", "_doppler_indices", "_radar_capture_meta"):
+            history = getattr(self, name, None)
+            if history is not None:
+                history.clear()
+        self._doppler_dirty = True
         self.block_acc.clear()
         self.block_time.clear()
         self.last_display_block = -1
@@ -916,6 +1095,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self.radar_tx.stop()
             self._tx_waveform = None
             self._active_ping_config = None
+            for name in ("_doppler", "_sample_radar", "_doppler_indices", "_radar_capture_meta"):
+                history = getattr(self, name, None)
+                if history is not None:
+                    history.clear()
+            self._doppler_dirty = True
 
     @PyQt6.QtCore.pyqtSlot(int)
     def set_display_width(self, w):
@@ -964,10 +1148,6 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     def constellation(self):
         return self.display_mode == "constellation"
 
-    @PyQt6.QtCore.pyqtProperty(bool, notify=displayModeChanged)
-    def spectrum(self):
-        return self.display_mode == "spectrum"
-
     @PyQt6.QtCore.pyqtProperty(int, notify=traceSampleCountChanged)
     def traceSampleCount(self):
         return self.fft_size
@@ -986,7 +1166,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtProperty(bool, notify=displayModeChanged)
     def radarMode(self):
-        return self.display_mode == "radar"
+        return self.display_mode in ("radar", "doppler")
 
     @PyQt6.QtCore.pyqtProperty(str, notify=radarStatusChanged)
     def radarStatus(self):
@@ -1080,6 +1260,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """Select the board used by every receive view, including angle/radar."""
         if index == self.active_board or not hasattr(self, "pool") or not (0 <= index < len(self.receiver.boards)):
             return
+        self._doppler.clear()
+        if hasattr(self, "_sample_radar"):
+            self._sample_radar.clear()
+            self._doppler_dirty = True
+        self._doppler_indices.clear()
+        self._radar_capture_meta.clear()
         self.active_board = index
         self.boardSelectionChanged.emit()
         self._angle_estimate_deg = float("nan")
@@ -1094,7 +1280,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.block_time = {}
         for p in self.providers:
             p.clear()
-        if self.display_mode in ("time", "ping", "constellation", "spectrum", "angle", "radar"):
+        if self.display_mode in ("time", "ping", "constellation", "angle", "radar"):
             self._publish_sample_windows({})
 
         self.waterfallFrameReady.emit()
@@ -1103,18 +1289,6 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _placeholder_row(self):
         return np.full((self.display_width, 4), (40, 40, 46, 255), dtype=np.uint8)
-
-    def _display_spectrum(self, x):
-        """Windowed, fftshifted FFT; x must be fft_size samples long."""
-        return np.fft.fftshift(np.fft.fft(x * self._win))
-
-    def _power_row(self, spec):
-        db = 20 * np.log10(np.maximum(np.abs(spec) / self._fft_scale, 1e-12))
-        return power_db_row(db, self.display_width, DB_MIN, DB_MAX)
-
-    def _phase_row(self, rel):
-        pooled = pool_complex_to_width(rel, self.display_width)
-        return (PHASE_MAPPER.to_rgba(np.angle(pooled)[np.newaxis, :]) * 255).astype(np.uint8)[0]
 
     def start_render(self):
         if self.render_running:
@@ -1127,34 +1301,42 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         if not traces:
             if self.display_mode == "radar":
-                self._radar_status = "Waiting for IQ samples."
+                self._radar_status = "Waiting for IQ samples; holding previous frame."
                 self.radarStatusChanged.emit()
-                empty = np.zeros((self.delaySize, self.angleSize, 4), dtype=np.uint8)
-                self.radarMapChanged.emit(empty.reshape(-1).tolist())
             return
+
+        if self.display_mode == "radar":
+            now = time.monotonic()
+            if now - self._radar_last_render_time < 0.1:
+                return
+            self._radar_last_render_time = now
+
+        if self.display_mode in ("time", "ping", "angle", "radar") and self.remove_los and self._clutter_mode == "zero_doppler":
+            if len(self._doppler.frames) < 2:
+                # Do not replace the last map with a blank warm-up frame.
+                message = f"Zero Doppler: collecting {len(self._doppler.frames)}/2 coherent samples"
+                if self.display_mode == "radar":
+                    self._radar_status = message
+                    self.radarStatusChanged.emit()
+                return
+            # Subtract the raw-IQ mean from this actual display window. Tile
+            # the 256-sample template for multi-chunk Ping/time/AoA windows.
+            background = dict(zip(self._rx_sensor_ids(), self._doppler.mean_frame()))
+            traces = {a: np.asarray(trace)-np.resize(background[a], np.asarray(trace).size)
+                      if a in background else trace for a, trace in traces.items()}
 
         # Clutter calibration/subtraction is defined in raw IQ, before
         # matched filtering. Restrict it to the requested radar-related modes.
-        if self.display_mode in ("ping", "angle", "radar") and self.remove_los:
+        if self.display_mode in ("time", "ping", "angle", "radar") and self.remove_los:
             traces = self._cancel_line_of_sight(traces)
 
-        # Compress the chirps when a transmit reference is available.
-        if self._tx_waveform is not None and self.display_mode in ("ping", "angle", "radar") and traces:
-            # Coherently compress incoming chirps into sharp range profile peaks
-            matched_traces = {antid: self._angle_matched_trace(trace) for antid, trace in traces.items()}
-            common_length = min((t.size for t in matched_traces.values()), default=0)
-
-            if common_length > 0:
-                matched_traces = {antid: t[:common_length] for antid, t in matched_traces.items()}
-
-                # Route appropriate domains based on active mode context
-                if self.display_mode in ("angle", "radar"):
-                    # Angle and Radar modes use pulse-compressed residual IQ.
-                    traces = matched_traces
-                elif self.display_mode == "ping":
-                    # Keep raw, environment-subtracted voltage traces for the
-                    # chart; its correlation overlay uses the same residual.
-                    pass
+        # Ping charts compute their correlation overlay on the GUI thread.
+        if self._tx_waveform is not None and self.display_mode in ("angle", "radar"):
+            reference, _ = receive_chirp_reference(self._tx_waveform, self._reference_ping_config(), self._spectrum_sample_rate_hz)
+            matched = {antid: self._angle_matched_trace(trace, reference) for antid, trace in traces.items()}
+            common_length = min(t.size for t in matched.values())
+            if common_length:
+                traces = {antid: trace[:common_length] for antid, trace in matched.items()}
 
         if self.display_mode not in ("angle", "radar") and self.iqcontrol is not None:
             calibrated = {}
@@ -1164,11 +1346,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 calibrated[antid] = values if correction is None else np.fft.ifft(np.fft.ifftshift(np.fft.fftshift(np.fft.fft(values)) * correction)).astype(np.complex64)
             traces = calibrated
 
-        # Publish chart samples under the shared lock.
-        with self._sample_window_lock:
-            self._sample_window_present = [antid in traces for antid in range(SENSOR_COUNT)]
-            self._sample_windows = [np.asarray(traces.get(antid, np.zeros(self.fft_size, dtype=np.complex64))).copy() for antid in range(SENSOR_COUNT)]
-            self._sample_window_generation += 1
+        if self.display_mode in ("time", "ping", "constellation"):
+            with self._sample_window_lock:
+                self._sample_window_present = [antid in traces for antid in range(SENSOR_COUNT)]
+                self._sample_windows = [np.asarray(traces[antid]).copy() if antid in traces else np.zeros(self.fft_size, dtype=np.complex64) for antid in range(SENSOR_COUNT)]
+                self._sample_window_generation += 1
 
         # Update the spatial display from the same samples.
         if self.display_mode == "angle" and traces:
@@ -1182,12 +1364,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self._angle_spectrum.fill(0)
                 self.angleChanged.emit()
 
-        # Missing channels are zero-filled by the calibration helper.
         if self.display_mode == "radar":
-            now = time.monotonic()
-            if now - self._radar_last_render_time >= 0.1:
-                self._radar_last_render_time = now
-                self._render_radar_heatmap(traces)
+            self._render_radar_heatmap(traces)
 
     @PyQt6.QtCore.pyqtSlot(int, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QScatterSeries, result="QVariantMap")
     def updateTimeChart(self, antid, i_series, q_series, correlation_series, peak_series):
@@ -1200,13 +1378,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 return {}
             iq = self._sample_windows[antid].copy()
             self._time_trace_consumed[antid] = generation
-            all_traces = {sensor_id: samples.copy() for sensor_id, samples in enumerate(self._sample_windows)}
 
         i_series.replace([PyQt6.QtCore.QPointF(x, float(y)) for x, y in enumerate(iq.real)])
         q_series.replace([PyQt6.QtCore.QPointF(x, float(y)) for x, y in enumerate(iq.imag)])
         correlation_limit = 1.0
         if self.display_mode == "ping" and getattr(self, "_tx_waveform", None) is not None:
-            complex_correlation, correlation, peaks = self._matched_filter(iq)
+            _, correlation, peaks = self._matched_filter(iq)
             correlation_series.replace([PyQt6.QtCore.QPointF(x, float(y)) for x, y in enumerate(correlation)])
             peak_series.replace([PyQt6.QtCore.QPointF(index, float(correlation[index])) for index in peaks])
             correlation_limit = max(float(np.max(np.abs(correlation))), 1.0) if correlation.size else 1.0
@@ -1243,32 +1420,9 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         series.replace([PyQt6.QtCore.QPointF(float(value.real), float(value.imag)) for value in iq])
 
-    @PyQt6.QtCore.pyqtSlot(int, PyQt6.QtCharts.QLineSeries, PyQt6.QtCharts.QValueAxis)
-    def updateSpectrumChart(self, antid, series, frequency_axis):
-        """Replace one sensor's two-sided, windowed amplitude spectrum."""
-        if not (0 <= antid < SENSOR_COUNT):
-            return
-        with self._sample_window_lock:
-            generation = self._sample_window_generation
-            if self._spectrum_consumed[antid] == generation:
-                return
-            present = self._sample_window_present[antid]
-            iq = self._sample_windows[antid].copy()
-            sample_rate_hz = self._spectrum_sample_rate_hz
-            center_hz = self._spectrum_center_hz
-            self._spectrum_consumed[antid] = generation
-        frequency_axis.setRange((center_hz - sample_rate_hz / 2) / 1e6, (center_hz + sample_rate_hz / 2) / 1e6)
-        if not present:
-            series.replace([])
-            return
-        spectrum = self._display_spectrum(iq)
-        amplitude_dbfs = 20 * np.log10(np.maximum(np.abs(spectrum) / self._fft_scale, 1e-12))
-        frequencies_mhz = (center_hz + np.fft.fftshift(np.fft.fftfreq(len(iq), d=1 / sample_rate_hz))) / 1e6
-        series.replace([PyQt6.QtCore.QPointF(float(frequency), float(amplitude)) for frequency, amplitude in zip(frequencies_mhz, amplitude_dbfs)])
-
     @PyQt6.QtCore.pyqtSlot(PyQt6.QtCharts.QLineSeries)
     def updateAngleChart(self, series):
-        """Publish the current spatial FFT/MUSIC angle spectrum to QML."""
+        """Publish the current beamforming azimuth cut to QML."""
         if self.display_mode != "angle":
             return
         spectrum = np.asarray(self._angle_spectrum, dtype=np.float32).reshape(-1)
@@ -1277,26 +1431,6 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         points = [PyQt6.QtCore.QPointF(-90.0 + index * 180.0 / max(1, spectrum.size - 1), float(value)) for index, value in enumerate(spectrum)]
         series.replace(points)
-
-    def _refresh_spectrum_config(self):
-        """Track RF center/sample rate without blocking the GUI thread."""
-        now = time.monotonic()
-        if now - self._spectrum_config_read_at < 1.0:
-            return
-        self._spectrum_config_read_at = now
-        try:
-            cfg = self.receiver.boards[self.active_board].iq.get_config()
-            sample_rate_hz = DECIM_TO_FS.get(int(cfg.get("adc_decimation", 1)), DECIM_TO_FS[1])
-            receivers = cfg.get("receivers", [])
-            center_hz = float(receivers[0].get("rf_freq_hz", 2437e6)) if receivers else 2437e6
-            with self._sample_window_lock:
-                rate_changed = self._spectrum_sample_rate_hz != sample_rate_hz
-                self._spectrum_sample_rate_hz = sample_rate_hz
-                self._spectrum_center_hz = center_hz
-            if rate_changed:
-                self.radarConfigChanged.emit()
-        except Exception as e:
-            print(f"spectrum config refresh error: {e}", file=sys.stderr)
 
     def _on_iq_cluster(self, cluster):
         """Pool cluster callback (runs on the pool's processing thread; keep
@@ -1331,6 +1465,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return []
         revision = self.receiver.boards[board].revision
         positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
+        selected = [(antid, *positions[antid]) for antid in self._rx_sensor_ids()]
         sets = []
 
         for arrived, cluster in clusters:
@@ -1347,6 +1482,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             if epoch != self._display_epoch:
                 if arrived < self._display_epoch_time:
                     continue
+                self._doppler.clear()
+                if hasattr(self, "_sample_radar"):
+                    self._sample_radar.clear()
+                    self._doppler_dirty = True
+                self._doppler_indices.clear()
+                self._radar_capture_meta.clear()
                 self._display_epoch = epoch
                 if getattr(self, "_remove_los", False):
                     self._reset_clutter()
@@ -1362,23 +1503,49 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 center = cluster.center_freq_hz[present][0]
             with self._sample_window_lock:
                 rate_changed = self._spectrum_sample_rate_hz != float(rate)
+                rf_changed = self._spectrum_center_hz != float(center)
                 self._spectrum_sample_rate_hz = float(rate)
                 self._spectrum_center_hz = float(center)
-            if rate_changed:
+            if rate_changed or rf_changed:
+                self._doppler.clear()
+                if hasattr(self, "_sample_radar"):
+                    self._sample_radar.clear()
+                    self._doppler_dirty = True
                 self.radarConfigChanged.emit()
 
             if isinstance(cluster, IQAccumCluster):
                 completion = cluster.section_completion
                 sections = cluster.iq_sections
+                window = (cluster.source_chunk_end - cluster.source_chunk_start) & 0xFFFFFFFF
+                repeats = max(1, window // cluster.vector_chunks)
                 for lane in range(cluster.vector_chunks):
-                    per = {antid: sections[board, row, col, lane] for antid, (row, col) in enumerate(positions) if completion[board, row, col, lane] and antid in self._rx_sensor_ids()}
+                    per = {antid: sections[board, row, col, lane] for antid, row, col in selected if completion[board, row, col, lane]}
+                    available = [positions[a] for a in per]
+                    lane_counts = [cluster.counts[board, row, col, lane] for row, col in available]
+                    lane_hashes = [cluster.coverage_hashes[board, row, col, lane] for row, col in available]
+                    partial = any(n != repeats for n in lane_counts) or len(set(lane_hashes)) > 1
+                    if per and all(n > 0 for n in lane_counts):
+                        self._radar_capture_meta[cluster.chunk_index + lane] = dict(
+                            count=repeats, step=cluster.vector_chunks*CHUNK_SAMPLES,
+                            capture=cluster.chunk_index, partial=partial)
+                    if lane == 0:
+                        counts = [cluster.counts[board, row, col, 0] for _, row, col in selected]
+                        hashes = [cluster.coverage_hashes[board, row, col, 0] for _, row, col in selected]
+                        if counts and counts[0] > 0 and len(set(counts)) == 1 and len(set(hashes)) == 1:
+                            self._doppler_indices[cluster.chunk_index] = window
                     if per:
                         sets.append((cluster.chunk_index + lane, per))
             else:
                 completion = cluster.completion
                 iq = cluster.iq
-                per = {antid: iq[board, row, col] for antid, (row, col) in enumerate(positions) if completion[board, row, col] and antid in self._rx_sensor_ids()}
+                per = {antid: iq[board, row, col] for antid, row, col in selected if completion[board, row, col]}
                 if per:
+                    self._radar_capture_meta[cluster.chunk_index] = dict(count=1, step=0, capture=None, partial=False)
+                    trigger = self._display_config.get("trigger", {})
+                    interval = max(1, int(trigger.get("interval_chunks", 1))) if trigger.get("mode") == "interval" else 1
+                    phase = int(trigger.get("offset_chunks", 0))
+                    if (cluster.chunk_index - phase) % interval == 0:
+                        self._doppler_indices[cluster.chunk_index] = interval
                     sets.append((cluster.chunk_index, per))
 
         sets.sort(key=lambda entry: entry[0])
@@ -1400,13 +1567,13 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             try:
                 sets = self._drain_sets()
                 if not sets and not self.block_acc:
+                    if self.display_mode == "doppler" and self._doppler_dirty:
+                        self._render_doppler()
                     continue
                 if sets and not self._first_sets_logged:
                     self._first_sets_logged = True
                     self.logger.info("first synchronized IQ chunk sets received, display running")
                 mode = "time" if self.display_mode == "ping" else self.display_mode
-                if mode in ("spectrum", "angle"):
-                    self._refresh_spectrum_config()
                 # Every display mode assembles consecutive chunks into FFT
                 # blocks, allowing partial clusters to arrive out of order.
                 self._render_block_rows(sets, mode)
@@ -1440,10 +1607,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             for _, per_antenna in sets:
                 self._collect_clutter_snapshot(per_antenna)
         for idx, per in sets:
+            self._doppler_indices.pop(idx, None)
+            metadata = self._radar_capture_meta.pop(idx, None)
             b = idx // B
-            if b <= self.last_display_block:
+            if self.display_mode in ("time", "ping", "angle", "radar") and self.remove_los and self._clutter_mode == "zero_doppler":
+                # A complex mean needs coherent IQ, not uniform cadence. Learn
+                # every received chunk, including bursts with missing starts.
+                self._append_doppler(idx, per, 1)
+            if b <= self.last_display_block and self.display_mode != "doppler":
                 continue
-            block = self.block_acc.setdefault(b, {})
             if getattr(self, "_remove_los", False) and self._clutter_mode == "automatic":
                 first_background = not self._automatic_clutter.history
                 with self._clutter_lock:
@@ -1451,11 +1623,24 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     self._clutter_status_text = "Automatic clutter active · 16 chunks / 0.4 s"
                 if first_background:
                     self.clutterStatusChanged.emit()
-                if mode in ("time", "angle", "radar") and self.display_mode in ("ping", "angle", "radar"):
+                if mode in ("time", "angle", "radar", "doppler") and self.display_mode in ("time", "ping", "angle", "radar", "doppler"):
                     per = residual
-            for antid, iq in per.items():
-                block.setdefault(antid, {})[idx % B] = iq
-            self.block_time.setdefault(b, now)
+            if self.display_mode == "doppler" and metadata is not None:
+                if not metadata["partial"]:
+                    cleaned = self._cancel_line_of_sight(per) if self.remove_los and self._clutter_mode == "manual" else per
+                    corrected, _ = self._angle_corrected_traces(cleaned)
+                    if self._sample_radar.append(idx, {a: corrected[a, :len(t)] for a, t in cleaned.items()}, **metadata):
+                        self._doppler_dirty = True
+            if self.display_mode != "doppler":
+                block = self.block_acc.setdefault(b, {})
+                for antid, iq in per.items():
+                    block.setdefault(antid, {})[idx % B] = iq
+                self.block_time.setdefault(b, now)
+        if self.display_mode == "doppler":
+            self.block_acc.clear()
+            self.block_time.clear()
+            self._render_doppler()
+            return
         ready = []
         for b in sorted(self.block_acc):
             if now - self.block_time[b] < DISPLAY_SETTLE_SECONDS:
@@ -1489,7 +1674,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self.block_acc.pop(b, None)
             self.block_time.pop(b, None)
         ready = ready[-WATERFALL_HEIGHT:]
-        if mode in ("time", "constellation", "spectrum", "angle", "radar"):
+        if mode in ("time", "constellation", "angle", "radar"):
             self._render_sample_blocks(ready, B, mode)
             return
         # Batch FFT/color conversion: hundreds of tiny NumPy calls per
@@ -1533,7 +1718,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     def _render_sample_blocks(self, ready, B, mode):
         """Chart display at fft_size above one chunk: all sensors show the SAME
         newest ready block of fft_size samples (the multi-chunk analogue of
-        _render_sample_windows, same complete_only semantics: with it,
+        chunk display, same complete_only semantics: with it,
         only blocks where ALL sensors delivered every chunk are shown; without
         it, the newest block with at least one full per-sensor trace is shown
         and missing sensors are drawn as an empty grid)."""

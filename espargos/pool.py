@@ -343,7 +343,19 @@ class AntennaSelection:
                     else:
                         centers.add(tx_states[bi]["sensors"][a]["frequency_hz"])
                 if len(centers) != 1 or len(rates) > 1:
-                    raise ValueError("Selected IQ sensors require one frequency and RX sample rate")
+                    details = []
+                    for bi in scope.active:
+                        grouped = {}
+                        for a in scope.ids[bi]:
+                            mode = configs[bi]["modes"][a]
+                            frequency = (configs[bi]["receivers"][a]["rf_freq_hz"] if mode == "iq_rx"
+                                         else tx_states[bi]["sensors"][a]["frequency_hz"])
+                            rate = DECIM_TO_FS.get(configs[bi]["adc_decimation"]) if mode == "iq_rx" else None
+                            grouped.setdefault((mode, frequency, rate), []).append(a)
+                        for (mode, frequency, rate), ids in grouped.items():
+                            sampling = f", RX {rate / 1e6:g} MSa/s" if rate is not None else ""
+                            details.append(f"{owner.boards[bi].host} sensors {ids}: {mode}, {frequency / 1e6:g} MHz{sampling}")
+                    raise ValueError("Selected IQ sensors require one frequency and RX sample rate; " + "; ".join(details))
                 cables = dict(cable_lengths=owner._geometry.cables, cable_velocity_factors=owner._geometry.velocity_factors)
                 try:
                     if tx_selected:
