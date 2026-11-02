@@ -11,8 +11,8 @@ python demos/custom/pulse-radar-analyzer/pulse-radar-analyzer.py -s BOARD_HOST
 python demos/custom/pulse-radar-analyzer/pulse-radar-analyzer-espargi.py -c config/rx-and-tx-espargos.yml
 ```
 
-The previous `demos/pulse-radar-analyzer/*.py` commands continue to work through
-compatibility launchers. Existing arguments and configuration files are supported.
+Use these maintained paths directly. Existing arguments and configuration
+files are supported.
 See the [radar README](pulse-radar-analyzer/README.md) for operation and tests.
 
 `common/` contains copies of the current generic demo shell and configuration
@@ -21,7 +21,23 @@ controls, waterfall renderer, and TX UI/controller/plot/waveform components.
 Python and QML imports resolve to these local copies. The radar still uses the
 repository's `espargos` library and installed Python/Qt dependencies.
 
-The copies come from `demos/common`, `demos/iq/common`, and
-`demos/iq/transmit-beamforming` after integration of upstream `5b3eebe`.
-When integrating future upstream changes, compare these sources and port their
-updates into `common/`, preserving the local import paths and radar hooks.
+The copies were audited against upstream `8ed09db` (2 November 2026).
+The upstream sources are:
+
+| Custom helper | Upstream source |
+| --- | --- |
+| Generic application, configuration manager, drawer and assets | `demos/common/` |
+| `iq_application.py`, RX controls and waterfall | `demos/iq/common/` (`application.py` becomes `iq_application.py`) |
+| `iq_tx_application.py`, `iq_tx_controller.py`, `iq_tx_plot.py`, `iq_tx_waveform.py` and TX QML | `demos/iq/transmit-beamforming/` (Python modules gain the `iq_tx_` prefix) |
+
+These copies already contain the current upstream common code. Intentional
+local differences are the custom import paths, sample-based radar waveform
+controls and preview hooks, and `WaterfallImageProvider.set_frame` for native
+map textures. Preserve those additions when refreshing the copies.
+
+Both custom demos use the current `Pool.iq` callback interface and unwrapped
+`IQAccumCluster.chunk_index` display grid. The library merge adds controller
+API v5 support, live WiFi runtime configuration with an API v4 legacy fallback,
+and idle retry of failed Signal acknowledgements. The IQ receiver owns Signal
+transport maintenance; custom displays should not duplicate acknowledgement or
+recovery logic.

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import numpy as np
 
 DEMO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(DEMO.parents[2]))
 sys.path.insert(0, str(DEMO))
 from radar_signal import resample_replay
 from radar_waveform import beam_source, pulse_waveform, replay_samples, prepare_source

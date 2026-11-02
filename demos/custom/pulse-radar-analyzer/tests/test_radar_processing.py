@@ -16,6 +16,23 @@ Analyzer = module.EspargosPulseRadarAnalyzer
 
 
 class RadarProcessingTest(unittest.TestCase):
+    def test_pluto_startup_subscribes_through_current_pool_iq_api(self):
+        # A Pool spec intentionally has no obsolete add_iq_callback method.
+        pool = Mock(spec=module.espargos.Pool)
+        pool.boards = [SimpleNamespace(host="rx")]
+        pool.iq = Mock(spec=module.espargos.IQReceiver)
+        controller = Mock()
+        backend = SimpleNamespace(pool=pool, logger=Mock(),
+            create_iq_controller=Mock(return_value=controller), appconfig=Mock(),
+            engine=Mock(), _update_display_config=Mock(), _on_iq_cluster=Mock(), start_render=Mock())
+        Analyzer._start_iq_gui(backend)
+        self.assertIs(backend.iqcontrol,controller)
+        pool.iq.add_callback.assert_called_once()
+        pool.iq.add_accumulation_callback.assert_called_once()
+        self.assertIs(pool.iq.add_callback.call_args.args[0],backend._on_iq_cluster)
+        controller.sync_async.assert_called_once()
+        backend.start_render.assert_called_once()
+
     def test_peak_lists_reject_noise_and_keep_pronounced_returns(self):
         spec = importlib.util.spec_from_file_location("espargi_peaks", DEMO_DIR / "pulse-radar-analyzer-espargi.py")
         mixed = importlib.util.module_from_spec(spec)

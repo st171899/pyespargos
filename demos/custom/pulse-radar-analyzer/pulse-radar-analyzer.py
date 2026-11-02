@@ -1012,7 +1012,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """Drain raw or accumulated clusters into 256-sample display sets.
 
         An accumulated vector is split back into its ordered vector sections,
-        using ``source_chunk_start + lane`` as the display-grid index.
+        using the receiver's unwrapped ``chunk_index + lane`` display grid.
         """
         with self._pending_lock:
             cutoff = time.monotonic() - DISPLAY_SETTLE_SECONDS
@@ -1068,7 +1068,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 for lane in range(cluster.vector_chunks):
                     per = {antid: sections[board, row, col, lane] for antid, (row, col) in enumerate(positions) if completion[board, row, col, lane]}
                     if per:
-                        sets.append((cluster.source_chunk_start + lane, per))
+                        sets.append((cluster.chunk_index + lane, per))
             else:
                 completion = cluster.completion
                 iq = cluster.iq
@@ -1274,8 +1274,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _start_iq_gui(self):
         """After the framework pool is up: expose the pool's QML adapter,
-        subscribe the display to delivered clusters, and enter IQ mode. Sync
-        (anchors from WiFi packets) BEFORE entering IQ."""
+        subscribe through Pool.iq, and start reference synchronization.
+        The shared IQ application has already configured the receiver roles."""
         hosts = ", ".join(b.host for b in self.pool.boards)
         self.logger.info(f"IQ capture starting ({len(self.pool.boards)} board(s): {hosts})")
         self.iqcontrol = self.create_iq_controller()
@@ -1284,8 +1284,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
         # Observe each cluster from its first arrival; the display has its own
         # bounded settling window, independent of calibration/library consumers.
-        self.pool.add_iq_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
-        self.pool.add_accumulation_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
+        self.pool.iq.add_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
+        self.pool.iq.add_accumulation_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
 
         self.iqcontrol.sync_async()
         self.start_render()

@@ -20,6 +20,48 @@ from espargos.iq_transmitter import IQTransmitter
 
 
 class CalibrationRecoveryTest(unittest.TestCase):
+    def test_current_iq_capability_supports_api_v4_and_v5(self):
+        from espargos.board_iq import IQCapability
+        for major in (4,5):
+            with self.subTest(major=major):
+                board = Mock(api_version=(major,0))
+                board.control.get_json.return_value = {"modes":["iq_rx"]*8}
+                iq = IQCapability(board)
+                self.assertEqual(iq.get_config(),{"modes":["iq_rx"]*8})
+                board.control.get_json.assert_called_once_with('get_iq_control')
+                iq.set_config({"adc_decimation":1})
+                board.control.command.assert_called_once_with('set_iq_control',{"adc_decimation":1})
+
+    def test_wifi_configuration_uses_live_settings_with_legacy_fallback(self):
+        from espargos.board_wifi_rx import WiFiRxCapability
+        for major in (4,5):
+            with self.subTest(major=major):
+                board = Mock(api_version=(major,0))
+                board.control.get_json.return_value = {"channel-primary":1}
+                wifi = WiFiRxCapability(board)
+                self.assertEqual(wifi.get_config(),{"channel-primary":1})
+                wifi.set_config({"channel-primary":6})
+                board.control.get_json.assert_called_once_with('get_wifi_runtime')
+                board.control.command.assert_called_once_with('set_wifi_runtime',{"channel-primary":6})
+                board.control.get_json.reset_mock()
+                board.control.command.reset_mock()
+                missing = EspargosHTTPStatusError(404,'get_wifi_runtime','not found')
+                board.control.get_json.side_effect = [missing,{"channel-primary":11}]
+                board.control.command.side_effect = [missing,None]
+                if major == 4:
+                    self.assertEqual(wifi.get_config(),{"channel-primary":11})
+                    wifi.set_config({"channel-primary":1})
+                    self.assertEqual(board.control.get_json.call_args_list[-1].args,('get_wificonf',))
+                    self.assertEqual(board.control.command.call_args_list[-1].args,('set_wificonf',{"channel-primary":1}))
+                else:
+                    # V5 must never silently use saved boot defaults.
+                    with self.assertRaises(EspargosHTTPStatusError):
+                        wifi.get_config()
+                    with self.assertRaises(EspargosHTTPStatusError):
+                        wifi.set_config({"channel-primary":1})
+                    self.assertEqual(board.control.get_json.call_count,1)
+                    self.assertEqual(board.control.command.call_count,1)
+
     def test_mismatched_calibration_settings_identify_the_board_and_rate(self):
         from espargos.pool import AntennaSelection
         from espargos.calibration import Antenna

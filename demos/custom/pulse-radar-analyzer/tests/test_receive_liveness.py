@@ -7,7 +7,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -35,6 +35,40 @@ class ReceiveLivenessTest(unittest.TestCase):
         packet.source_chunk_end = source + 8192
         packet.sample_rate_hz, packet.center_freq_hz = 80_000_000, 2_400_000_000
         return receiver._get_cluster_key(0, SimpleNamespace(payload=packet))
+
+    def test_signal_ack_retries_from_idle_processing_and_respects_calibration(self):
+        from espargos.clustering import ClusterAssembler
+        receiver = object.__new__(IQReceiver)
+        board = Mock()
+        board.iq.acknowledge_signal_capture.side_effect = [RuntimeError("busy")]*3+[None]
+        receiver.boards = [board]
+        receiver._logger = Mock()
+        receiver._calibrating = False
+        receiver._signal_pending_ack = None
+        with patch('espargos.iq_receiver.time.sleep'), patch('espargos.iq_receiver.time.monotonic',return_value=10):
+            self.assertFalse(receiver._auto_acknowledge_signal_identity(7,12,'capture accepted'))
+        self.assertEqual(receiver._signal_pending_ack,(7,12,'capture accepted'))
+        with patch.object(ClusterAssembler,'_expire_cluster_caches'), patch('espargos.iq_receiver.time.monotonic',return_value=10.1):
+            receiver._expire_cluster_caches()
+        self.assertEqual(board.iq.acknowledge_signal_capture.call_count,3)
+        receiver._calibrating = True
+        with patch.object(ClusterAssembler,'_expire_cluster_caches'), patch('espargos.iq_receiver.time.monotonic',return_value=11):
+            receiver._expire_cluster_caches()
+            self.assertEqual(board.iq.acknowledge_signal_capture.call_count,3)
+            receiver._calibrating = False
+            receiver._expire_cluster_caches()
+        self.assertIsNone(receiver._signal_pending_ack)
+        board.iq.acknowledge_signal_capture.assert_called_with(7,12)
+
+    def test_pluto_display_uses_unwrapped_accumulation_index(self):
+        spec = importlib.util.spec_from_file_location('pluto_liveness',DEMO/'pulse-radar-analyzer.py')
+        pluto = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pluto)
+        cluster = self.cluster(0,4,8192,(1<<24)+8192)
+        backend = self.backend([(time.monotonic()-1,cluster)])
+        backend.pool = backend.receiver
+        sets = pluto.EspargosPulseRadarAnalyzer._drain_sets(backend)
+        self.assertEqual(sets[0][0],(1<<24)+8192)
 
     def test_board_local_generations_share_one_accumulation(self):
         receiver = self.receiver()
