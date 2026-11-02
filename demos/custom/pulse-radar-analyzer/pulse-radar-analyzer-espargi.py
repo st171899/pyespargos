@@ -34,7 +34,7 @@ from radar_tx import RadarTransmitter, configure_receivers, calibrate_radar_timi
 from beamforming import AZIMUTH_DEG, ELEVATION_DEG, planar_power, horizontal_power
 from clutter import RollingClutter
 from doppler import DopplerHistory
-from range_doppler import SampleRadar, minimal_replay
+from range_doppler import SampleRadar, minimal_replay, accumulation_layout
 from radar_signal import resample_replay
 from radar_signal import chirp_reference, local_geometry, matched_filter_peaks
 
@@ -239,6 +239,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler_velocity = np.zeros(0)
         self._doppler_last_render = 0.0
         self._doppler_dirty = True
+        self._doppler_rejection = None
         self._clutter_lock = threading.Lock()
         self._automatic_clutter = RollingClutter()
         self._clutter_mode = str(self.appconfig.get("clutter_mode") or "manual")
@@ -302,6 +303,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler.clear()
         if hasattr(self, "_sample_radar"):
             self._sample_radar.clear()
+            self._doppler_rejection = None
             self._doppler_dirty = True
         self.block_acc.clear()
         self.block_time.clear()
@@ -321,6 +323,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._doppler.clear()
             if hasattr(self, "_sample_radar"):
                 self._sample_radar.clear()
+                self._doppler_rejection = None
                 self._doppler_dirty = True
             self._doppler_velocity = np.zeros(0)
             self.display_mode = mode
@@ -363,6 +366,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._doppler.clear()
             if hasattr(self, "_sample_radar"):
                 self._sample_radar.clear()
+                self._doppler_rejection = None
                 self._doppler_dirty = True
         # Buffered display chunks may already contain automatic residuals.
         self.block_acc.clear()
@@ -550,10 +554,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _render_sample_radar(self):
         if not self._sample_radar.records:
-            self._doppler_info = "Waiting for sample-timestamp data."
+            self._doppler_info = getattr(self, "_doppler_rejection", None) or "Waiting for sample-timestamp data."
             # Keep the previous texture while the next observation fills.
             self.radarConfigChanged.emit()
-            self._radar_status = "Waiting for valid IQ chunks. Incomplete accumulated lanes are discarded; use Interval capture to retain motion information."
+            self._radar_status = ("Holding previous frame; accumulated coverage was rejected."
+                                  if getattr(self, "_doppler_rejection", None) else "Waiting for valid IQ chunks.")
             self.radarStatusChanged.emit()
             return
         cfg = self._reference_ping_config()
@@ -1263,6 +1268,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler.clear()
         if hasattr(self, "_sample_radar"):
             self._sample_radar.clear()
+            self._doppler_rejection = None
             self._doppler_dirty = True
         self._doppler_indices.clear()
         self._radar_capture_meta.clear()
@@ -1485,6 +1491,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self._doppler.clear()
                 if hasattr(self, "_sample_radar"):
                     self._sample_radar.clear()
+                    self._doppler_rejection = None
                     self._doppler_dirty = True
                 self._doppler_indices.clear()
                 self._radar_capture_meta.clear()
@@ -1510,6 +1517,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self._doppler.clear()
                 if hasattr(self, "_sample_radar"):
                     self._sample_radar.clear()
+                    self._doppler_rejection = None
                     self._doppler_dirty = True
                 self.radarConfigChanged.emit()
 
@@ -1517,17 +1525,29 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 completion = cluster.section_completion
                 sections = cluster.iq_sections
                 window = (cluster.source_chunk_end - cluster.source_chunk_start) & 0xFFFFFFFF
-                repeats = max(1, window // cluster.vector_chunks)
+                repeats = int(cluster.nominal_chunks)
                 for lane in range(cluster.vector_chunks):
                     per = {antid: sections[board, row, col, lane] for antid, row, col in selected if completion[board, row, col, lane]}
                     available = [positions[a] for a in per]
                     lane_counts = [cluster.counts[board, row, col, lane] for row, col in available]
                     lane_hashes = [cluster.coverage_hashes[board, row, col, lane] for row, col in available]
                     partial = any(n != repeats for n in lane_counts) or len(set(lane_hashes)) > 1
+                    layout = None if partial or not lane_hashes else accumulation_layout(
+                        cluster.source_chunk_start, cluster.source_chunk_end,
+                        cluster.vector_chunks, repeats, lane, lane_hashes[0])
                     if per and all(n > 0 for n in lane_counts):
-                        self._radar_capture_meta[cluster.chunk_index + lane] = dict(
-                            count=repeats, step=cluster.vector_chunks*CHUNK_SAMPLES,
-                            capture=cluster.chunk_index, partial=partial)
+                        metadata = dict(count=repeats, step=cluster.vector_chunks*CHUNK_SAMPLES,
+                                        capture=cluster.chunk_index, partial=partial or layout is None)
+                        if layout is not None:
+                            offset, step = layout
+                            metadata["step"] = step*CHUNK_SAMPLES
+                            if offset != lane:
+                                metadata["source_index"] = cluster.chunk_index+offset
+                        else:
+                            metadata["rejection"] = (
+                                f"Accumulated IQ received: incomplete coverage ({min(lane_counts)}–{max(lane_counts)}/{repeats} contributions)."
+                                if partial else "Accumulated IQ received: source coverage cannot be identified from its fingerprint.")
+                        self._radar_capture_meta[cluster.chunk_index + lane] = metadata
                     if lane == 0:
                         counts = [cluster.counts[board, row, col, 0] for _, row, col in selected]
                         hashes = [cluster.coverage_hashes[board, row, col, 0] for _, row, col in selected]
@@ -1627,10 +1647,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     per = residual
             if self.display_mode == "doppler" and metadata is not None:
                 if not metadata["partial"]:
+                    source_index = metadata.pop("source_index", idx)
                     cleaned = self._cancel_line_of_sight(per) if self.remove_los and self._clutter_mode == "manual" else per
                     corrected, _ = self._angle_corrected_traces(cleaned)
-                    if self._sample_radar.append(idx, {a: corrected[a, :len(t)] for a, t in cleaned.items()}, **metadata):
+                    if self._sample_radar.append(source_index, {a: corrected[a, :len(t)] for a, t in cleaned.items()}, **metadata):
+                        self._doppler_rejection = None
                         self._doppler_dirty = True
+                else:
+                    self._doppler_rejection = metadata.get("rejection", "Accumulated IQ received: incomplete source coverage.")
+                    self._doppler_dirty = True
             if self.display_mode != "doppler":
                 block = self.block_acc.setdefault(b, {})
                 for antid, iq in per.items():

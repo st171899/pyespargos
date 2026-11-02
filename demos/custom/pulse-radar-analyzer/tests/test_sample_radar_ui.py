@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import unittest
 import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 from PyQt6.QtCore import QObject, QEventLoop, QTimer, QMetaObject, Qt
@@ -81,8 +83,8 @@ class SampleRadarUITest(unittest.TestCase):
             indices = [0, 1, 2, 3, 2048, 2049, 2050, 2051]
             sets = []
             for index in indices:
-                time = index*256 + np.arange(256)
-                trace = 200*app._tx_waveform[(time-23) % 256]*np.exp(-2j*np.pi*2*2.4e9*velocity/module.espargos.constants.SPEED_OF_LIGHT*time/80e6)
+                sample_time = index*256 + np.arange(256)
+                trace = 200*app._tx_waveform[(sample_time-23) % 256]*np.exp(-2j*np.pi*2*2.4e9*velocity/module.espargos.constants.SPEED_OF_LIGHT*sample_time/80e6)
                 sets.append((index, {a: trace.astype(np.complex64) for a in range(8)}))
                 app._radar_capture_meta[index] = dict(count=1, step=0, capture=None, partial=False)
             app._display_config = dict(trigger=dict(mode='interval', interval_chunks=2048, offset_chunks=0, burst_chunks=4))
@@ -124,6 +126,49 @@ class SampleRadarUITest(unittest.TestCase):
             app._radar_capture_meta[4096] = dict(count=8, step=256, capture=4096, partial=True)
             app._render_block_rows([(4096, sets[0][1])], 'doppler')
             self.assertNotIn(4096, app._sample_radar.records)
+            # Exercise the actual accumulate -> timestamp history -> rendered
+            # map path using the sparse coverage found in real packet headers.
+            from range_doppler import accumulation_response
+            app._sample_radar.clear()
+            app.setRadarVelocity(-2,False)
+            app.setRadarVelocity(2,True)
+            app.receiver = SimpleNamespace(boards=[SimpleNamespace(revision=SimpleNamespace(
+                antenna_id_to_row_col=lambda a:divmod(a,4)))])
+            cluster = object.__new__(module.IQAccumCluster)
+            cluster.chunk_index = cluster.source_chunk_start = 2342912
+            cluster.source_chunk_end = 2351104
+            cluster.nominal_chunks,cluster.vector_chunks = 1024,1
+            cluster.sample_rate_hz,cluster.center_freq_hz = 80_000_000,2_400_000_000
+            cluster.config_generation = np.full((1,2,4),4,np.uint32)
+            cluster._completion = np.ones((1,2,4),bool)
+            cluster._section_completion = np.ones((1,2,4,1),bool)
+            cluster._counts = np.full((1,2,4,1),1024,np.int32)
+            cluster._coverage_hashes = np.full((1,2,4,1),4125752773,np.uint32)
+            source = cluster.chunk_index*256+np.arange(256)
+            fd = -2*2.4e9/module.espargos.constants.SPEED_OF_LIGHT
+            trace = 200*app._tx_waveform[(source-23)%256]*np.exp(2j*np.pi*fd*source/80e6)*accumulation_response(fd,1024,2048/80e6)
+            cluster._sections = np.broadcast_to(trace,(1,2,4,1,256)).astype(np.complex64).copy()
+            app._display_config = dict(trigger=dict(mode='accumulate',vector_chunks=1,interval_chunks=8192,offset_chunks=0))
+            app._pending_clusters = [(time.monotonic()-1,cluster)]
+            app._doppler_last_render = 0
+            before = len(frames)
+            app._render_block_rows(app._drain_sets(),'doppler')
+            self.assertEqual(len(app._sample_radar.records),1)
+            record = app._sample_radar.records[cluster.chunk_index]
+            self.assertEqual(record[2:4],(1024,2048))
+            self.assertEqual(len(frames),before+1)
+            self.assertIn('Coherent Doppler',app.radarStatus)
+            self.assertNotIn('Waiting for sample-timestamp',app.dopplerProcessingInfo)
+            rgba = np.asarray(frames[-1]).reshape(app.delaySize,app.angleSize,4)
+            self.assertGreater(int(rgba[23,:,1].max()),1)
+            # Invalid fingerprints must explain the rejection, not wait forever.
+            app._sample_radar.clear()
+            cluster._coverage_hashes[:] ^= 1
+            app._pending_clusters = [(time.monotonic()-1,cluster)]
+            app._doppler_last_render = 0
+            app._render_block_rows(app._drain_sets(),'doppler')
+            self.assertFalse(app._sample_radar.records)
+            self.assertIn('source coverage cannot be identified',app.dopplerProcessingInfo)
             # A live search must let the Qt event loop run and let changed
             # limits cancel it before publishing an obsolete map.
             app._sample_radar.clear()

@@ -7,6 +7,7 @@ nulls do not become recoverable by changing host processing.
 """
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 import numpy as np
 import time
 
@@ -41,6 +42,41 @@ def minimal_replay(reference):
         if reference.size % period == 0 and np.allclose(reference, np.resize(reference[:period], reference.size), rtol=1e-5, atol=1e-7):
             return reference[:period].copy()
     return reference.copy()
+
+
+@lru_cache(maxsize=128)
+def accumulation_layout(source_start, source_end, vector, nominal, lane, coverage_hash):
+    """Recover a regular source grid using the firmware coverage fingerprint.
+
+    Some firmware accumulates a decimated source stream: nominal is then
+    smaller than window/vector even for a complete window. Verify candidate
+    source sequences with the wire FNV-1a word hash before assigning timestamps.
+    Unknown/missing coverage must never be presented as consecutive samples.
+    Returns (first offset in chunks, repetition step in chunks), or None.
+    """
+    span = (int(source_end)-int(source_start)) & 0xffffffff
+    vector, nominal, lane = int(vector), int(nominal), int(lane)
+    if span <= 0 or nominal <= 0 or not 0 <= lane < vector:
+        return None
+    if nominal*vector == span:
+        return lane, vector  # Full coverage has no missing source positions.
+    steps = {vector}
+    if span % nominal == 0:
+        steps.add(span//nominal)
+    for step in sorted(steps):
+        offsets = {lane}
+        if step % vector == 0:
+            offsets.add(lane*(step//vector))
+        for offset in sorted(offsets):
+            if offset+(nominal-1)*step >= span:
+                continue
+            fingerprint = 2166136261
+            for q in range(nominal):
+                index = (int(source_start)+offset+q*step) & 0xffffffff
+                fingerprint = ((fingerprint ^ index)*16777619) & 0xffffffff
+            if fingerprint == int(coverage_hash):
+                return offset, step
+    return None
 
 
 def migration_terms(data, weights, times, fd, velocity, sample_rate, offsets, reference_time):

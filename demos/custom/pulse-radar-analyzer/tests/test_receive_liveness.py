@@ -70,6 +70,43 @@ class ReceiveLivenessTest(unittest.TestCase):
         sets = pluto.EspargosPulseRadarAnalyzer._drain_sets(backend)
         self.assertEqual(sets[0][0],(1<<24)+8192)
 
+    def test_complete_sparse_accumulation_uses_nominal_count_and_verified_spacing(self):
+        cluster = self.cluster(0,4,2342912,(1<<24)+2342912)
+        cluster.nominal_chunks = 1024
+        cluster._counts[:] = 1024
+        cluster._coverage_hashes[:] = 4125752773
+        backend = self.backend([(time.monotonic()-1,cluster)])
+        sets = module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+        self.assertEqual(len(sets),1)
+        metadata = backend._radar_capture_meta[cluster.chunk_index]
+        self.assertFalse(metadata['partial'])
+        self.assertEqual(metadata['count'],1024)
+        self.assertEqual(metadata['step'],8*256)
+        for bad_count,bad_hash in [(1023,4125752773),(1024,4125752772)]:
+            cluster._counts[:] = bad_count
+            cluster._coverage_hashes[:] = bad_hash
+            backend = self.backend([(time.monotonic()-1,cluster)])
+            module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+            self.assertTrue(backend._radar_capture_meta[cluster.chunk_index]['partial'])
+            self.assertIn('Accumulated IQ received',backend._radar_capture_meta[cluster.chunk_index]['rejection'])
+
+    def test_sparse_vector_lanes_keep_their_verified_source_timestamps(self):
+        cluster = self.cluster(0,4,8192,(1<<24)+8192)
+        cluster.nominal_chunks,cluster.vector_chunks = 256,4
+        cluster._counts = np.full((2,2,4,4),256,np.int32)
+        cluster._coverage_hashes = np.broadcast_to(np.array(
+            [440011205,708422085,281369029,3731384773],np.uint32),(2,2,4,4)).copy()
+        cluster._section_completion = np.repeat(cluster._completion[...,None],4,axis=-1)
+        cluster._sections = np.ones((2,2,4,4,256),np.complex64)
+        backend = self.backend([(time.monotonic()-1,cluster)])
+        module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+        for lane in range(4):
+            display_index = cluster.chunk_index+lane
+            metadata = backend._radar_capture_meta[display_index]
+            self.assertFalse(metadata['partial'])
+            self.assertEqual(metadata['step'],32*256)
+            self.assertEqual(metadata.get('source_index',display_index),cluster.chunk_index+8*lane)
+
     def test_board_local_generations_share_one_accumulation(self):
         receiver = self.receiver()
         self.assertEqual(self.accumulation_key(receiver, 8192, generation=4), self.accumulation_key(receiver, 8192, generation=900))

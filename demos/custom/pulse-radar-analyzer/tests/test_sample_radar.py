@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from range_doppler import SampleRadar, accumulation_response
+from range_doppler import SampleRadar, accumulation_response, accumulation_layout
 from doppler import C
 
 FS, RF = 80e6, 2.4e9
@@ -33,6 +33,17 @@ def echo(index, reference, velocity, delay=23, count=1, step=0, amplitude=1):
 
 
 class SampleRadarTest(unittest.TestCase):
+    def test_sparse_firmware_accumulation_layout_matches_recorded_fingerprint(self):
+        # Actual captured header: a complete 8192-chunk window contains 1024
+        # contributions spaced 8 chunks apart, not 8192 consecutive inputs.
+        self.assertEqual(accumulation_layout(2342912,2351104,1,1024,0,4125752773),(0,8))
+        self.assertIsNone(accumulation_layout(2342912,2351104,1,1024,0,4125752772))
+        # Four-lane variants must preserve the lane's verified source offset.
+        for lane,fingerprint in enumerate([440011205,708422085,281369029,3731384773]):
+            self.assertEqual(accumulation_layout(8192,16384,4,256,lane,fingerprint),(lane*8,32))
+        for lane,fingerprint in enumerate([440011205,1825938117,3951943109,3535305925]):
+            self.assertEqual(accumulation_layout(8192,16384,4,256,lane,fingerprint),(lane,32))
+
     def test_alias_spacing_uses_observed_burst_and_accumulation_positions(self):
         ref, radar = replay(), SampleRadar(64)
         # Requested K can differ from what arrived. Missing an entire burst

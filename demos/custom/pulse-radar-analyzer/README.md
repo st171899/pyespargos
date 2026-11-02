@@ -559,6 +559,24 @@ to `pulse-radar-analyzer-espargi`; the other demos retain their own processing.
 Static and rolling clutter modes retain
 their existing behavior.
 
+### Accumulation source timestamps
+
+Doppler accepts complete accumulation windows using the firmware-reported
+`nominal_chunks`, which need not equal the window length divided by vector
+length. For example, recorded 8192-chunk windows contain 1024 contributions
+at eight-chunk spacing. Comparing that count with 8192 wrongly rejects every
+window and leaves the plot waiting for timestamp data.
+
+For sparse accumulation, the analyzer verifies candidate regular source
+positions against the packet's coverage fingerprint before assigning the
+first sample timestamp and averaging step. It models averaging with that
+verified step, preserving its real attenuation/null velocities. Full-coverage
+windows keep their existing path. Incomplete, inconsistent or unidentified
+coverage is still rejected and now reports why, while retaining the last map.
+A replay of 2214 distinct complete windows from a saved hardware metadata
+capture verified eight-chunk spacing in every case. This replay validates
+metadata interpretation, not a new live Doppler-accuracy measurement.
+
 ### Calibration setup mismatches
 
 `Selected IQ sensors require one frequency and RX sample rate` is a setup
