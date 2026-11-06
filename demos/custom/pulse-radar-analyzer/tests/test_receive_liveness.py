@@ -95,6 +95,7 @@ class ReceiveLivenessTest(unittest.TestCase):
         cluster.source_chunk_end = cluster.source_chunk_start+256
         cluster.nominal_chunks,cluster.vector_chunks = 4,4
         cluster._counts = np.full((2,2,4,4),4,np.int32)
+        cluster._flags = np.zeros_like(cluster._counts, dtype=np.uint32)
         cluster._coverage_hashes = np.full((2,2,4,4),2196396053,np.uint32)
         cluster._section_completion = np.repeat(cluster._completion[...,None],4,axis=-1)
         cluster._sections = np.ones((2,2,4,4,256),np.complex64)
@@ -111,6 +112,7 @@ class ReceiveLivenessTest(unittest.TestCase):
         cluster = self.cluster(0,4,8192,(1<<24)+8192)
         cluster.nominal_chunks,cluster.vector_chunks = 256,4
         cluster._counts = np.full((2,2,4,4),256,np.int32)
+        cluster._flags = np.zeros_like(cluster._counts, dtype=np.uint32)
         cluster._coverage_hashes = np.broadcast_to(np.array(
             [440011205,708422085,281369029,3731384773],np.uint32),(2,2,4,4)).copy()
         cluster._section_completion = np.repeat(cluster._completion[...,None],4,axis=-1)
@@ -185,6 +187,7 @@ class ReceiveLivenessTest(unittest.TestCase):
             active_board=0,
             receiver=SimpleNamespace(boards=[SimpleNamespace(revision=SimpleNamespace(antenna_id_to_row_col=lambda a: divmod(a, 4))), object()]),
             _display_epoch=("accum", (4,)),
+            _display_config={},
             _display_epoch_time=0,
             block_acc={9: {}},
             block_time={9: 0},
@@ -202,6 +205,7 @@ class ReceiveLivenessTest(unittest.TestCase):
         cluster.source_chunk_end = wire_index + 8192
         cluster.nominal_chunks = 8192
         cluster._counts = np.full((2, 2, 4, 1), 8192)
+        cluster._flags = np.zeros_like(cluster._counts, dtype=np.uint32)
         cluster._coverage_hashes = np.ones((2, 2, 4, 1), np.uint32)
         cluster.chunk_index, cluster.vector_chunks, cluster.sample_rate_hz = index, 1, 80e6
         cluster.center_freq_hz = 2.4e9
@@ -224,6 +228,7 @@ class ReceiveLivenessTest(unittest.TestCase):
         cluster.vector_chunks = 4
         cluster.nominal_chunks = 2048
         cluster._counts = np.full((2, 2, 4, 4), 2048)
+        cluster._flags = np.zeros_like(cluster._counts, dtype=np.uint32)
         cluster._coverage_hashes = np.ones((2, 2, 4, 4), np.uint32)
         cluster._section_completion = np.repeat(cluster._completion[..., None], 4, axis=-1)
         cluster._sections = np.ones((2, 2, 4, 4, 256), np.complex64)
