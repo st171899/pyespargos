@@ -9,7 +9,7 @@ import QtQuick.Layouts
  *
  * Provides the common ESPARGOS IQ interface: center frequency, sample rate
  * (ADC decimation), analog RX filter bandwidth, RF switch, gain and trigger
- * configuration (Interval / Accumulate / Signal, including holdoff), plus the time-sync
+ * configuration (Interval / Accumulate / Signal / Radar, including holdoff), plus the time-sync
  * and phase-calibration actions. Mode handling is not exposed: the
  * application enters IQ mode at startup and restores WiFi/CSI mode on exit.
  *
@@ -35,6 +35,7 @@ GridLayout {
 	property var controller: null
 
 	property bool _loading: true
+	objectName: "iqCaptureSettings"
 
 	// Named trigger fields, matching the controller HTTP API.
 	property var triggerModes: [
@@ -55,6 +56,14 @@ GridLayout {
 			{k: "capture_chunks", l: "Capture chunks (56–112)", v: "56"},
 			{k: "quiet_threshold", l: "Quiet threshold", v: "0"}
 		]}
+        ,{ name: "Radar", mode: "radar", fields: [
+            {k: "vector_chunks", l: "Vector (fixed 1)", v: "1"},
+            {k: "interval_chunks", l: "Profile spacing", v: "24"},
+            {k: "offset_chunks", l: "Offset chunks", v: "0"},
+            {k: "pulses", l: "Profiles / batch", v: "256"},
+            {k: "cycle_windows", l: "Windows / cycle", v: "3255"},
+            {k: "accumulation_chunks", l: "Chunks / sum (1–64)", v: "8"}
+        ]}
 	]
 	property var triggerValues: triggerModes[0].fields.map(d => d.v)
 
@@ -263,6 +272,7 @@ GridLayout {
 	Label { text: "Trigger"; color: "#ffffff"; Layout.alignment: Qt.AlignRight; Layout.fillWidth: true }
 	ComboBox {
 		id: triggerCombo
+        objectName: "iqTriggerSelector"
 		implicitWidth: 210
 		model: triggerModes.map(mode => mode.name)
 		onActivated: {
@@ -274,6 +284,7 @@ GridLayout {
 			? "Array-wide wired-OR detection. Any enabled sensor may trigger; every sensor then streams the same capture. A 56-chunk capture contains the complete bank with the threshold crossing; larger values include more of the following bank. Trigger sensors is an 8-bit mask (for example 0xff)."
 			: ""
 	}
+
 
 	Flow {
 		Layout.columnSpan: 2
@@ -287,6 +298,7 @@ GridLayout {
 				spacing: 0
 				Label { text: modelData.l; font.pixelSize: 10; color: "#9fb3c8" }
 				TextField {
+                    readOnly: iqsettings.triggerModes[triggerCombo.currentIndex].mode === "radar" && modelData.k === "vector_chunks"
 					text: iqsettings.triggerValues[index] !== undefined
 						? iqsettings.triggerValues[index] : modelData.v
 					implicitWidth: 74

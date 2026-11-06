@@ -102,6 +102,7 @@ def strongest_horizontal_power(samples, frequency, spacing, bins=256):
     real_dtype = samples.real.dtype
     weights_real = np.ascontiguousarray(weights.real, dtype=real_dtype)
     weights_imag = np.ascontiguousarray(weights.imag, dtype=real_dtype)
+    combined_weights = np.concatenate((2*weights_real, -2*weights_imag), axis=1)
     result = np.empty((len(samples), samples.shape[-1]), np.float64)
     for start in range(0, len(samples), 16):
         block = samples[start:start+16]
@@ -110,8 +111,9 @@ def strongest_horizontal_power(samples, frequency, spacing, bins=256):
             result[start:start+16] = diagonal
             continue
         correlation = np.asarray([np.sum(block[:, :, lag:] * block[:, :, :-lag].conj(), axis=(1, 2)) for lag in range(1, columns)])
-        power = diagonal[None] + 2*(
-            np.einsum('bl,lvt->bvt', weights_real, correlation.real, optimize=False) -
-            np.einsum('bl,lvt->bvt', weights_imag, correlation.imag, optimize=False))
+        # One small matrix product evaluates the same steering polynomial.
+        # Keep all direction bins and channels; only the execution order changes.
+        components = np.concatenate((correlation.real, correlation.imag), axis=0)
+        power = diagonal[None] + (combined_weights @ components.reshape(2*(columns-1), -1)).reshape(bins, *diagonal.shape)
         result[start:start+16] = np.maximum(power.max(axis=0), 0)
     return result

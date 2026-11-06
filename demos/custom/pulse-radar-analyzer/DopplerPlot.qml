@@ -6,6 +6,11 @@ import QtQuick.Layouts
 Rectangle {
     id: plot
     color: "#101014"
+    function rangeLabel(index) {
+        const sample = backend.delayMin + index*(backend.delayMax-backend.delayMin-1)/4;
+        return isFinite(backend.radarZeroSample) ? ((sample-backend.radarDisplayZeroSample)*backend.radarMetersPerSample).toFixed(2) + " m" : sample.toFixed(0) + " samp";
+    }
+    Label { id: rangeMeasure; visible: false; text: plot.rangeLabel(4) }
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 20
@@ -18,7 +23,7 @@ Rectangle {
             id: chart
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.leftMargin: 90
+            Layout.leftMargin: Math.max(90, rangeMeasure.implicitWidth + 12)
             Layout.bottomMargin: 50
             Image {
                 id: samples
@@ -72,10 +77,7 @@ Rectangle {
                         anchors.right: parent.left
                         anchors.rightMargin: 8
                         anchors.verticalCenter: parent.top
-                        text: {
-                            const sample = backend.delayMin + index*(backend.delayMax-backend.delayMin-1)/4;
-                            return isFinite(backend.radarZeroSample) ? ((sample-backend.radarZeroSample)*backend.radarMetersPerSample).toFixed(2) + " m" : sample.toFixed(0) + " samp";
-                        }
+                        text: plot.rangeLabel(index)
                     }
                 }
             }

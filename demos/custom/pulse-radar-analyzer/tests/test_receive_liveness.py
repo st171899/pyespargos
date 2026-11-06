@@ -90,6 +90,23 @@ class ReceiveLivenessTest(unittest.TestCase):
             self.assertTrue(backend._radar_capture_meta[cluster.chunk_index]['partial'])
             self.assertIn('Accumulated IQ received',backend._radar_capture_meta[cluster.chunk_index]['rejection'])
 
+    def test_hardware_shared_vector_fingerprint_keeps_all_four_lanes(self):
+        cluster = self.cluster(0,4,1003520,(1<<24)+1003520)
+        cluster.source_chunk_end = cluster.source_chunk_start+256
+        cluster.nominal_chunks,cluster.vector_chunks = 4,4
+        cluster._counts = np.full((2,2,4,4),4,np.int32)
+        cluster._coverage_hashes = np.full((2,2,4,4),2196396053,np.uint32)
+        cluster._section_completion = np.repeat(cluster._completion[...,None],4,axis=-1)
+        cluster._sections = np.ones((2,2,4,4,256),np.complex64)
+        backend = self.backend([(time.monotonic()-1,cluster)])
+        sets = module.EspargosPulseRadarAnalyzer._drain_sets(backend)
+        self.assertEqual(len(sets),4)
+        for lane in range(4):
+            metadata = backend._radar_capture_meta[cluster.chunk_index+lane]
+            self.assertFalse(metadata['partial'])
+            self.assertEqual(metadata['step'],64*256)
+            self.assertEqual(metadata.get('source_index',cluster.chunk_index+lane),cluster.chunk_index+lane)
+
     def test_sparse_vector_lanes_keep_their_verified_source_timestamps(self):
         cluster = self.cluster(0,4,8192,(1<<24)+8192)
         cluster.nominal_chunks,cluster.vector_chunks = 256,4

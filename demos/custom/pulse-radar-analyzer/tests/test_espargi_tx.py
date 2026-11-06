@@ -155,7 +155,7 @@ class RadarTXTest(unittest.TestCase):
                 appconfig=SimpleNamespace(set=config.update), radarConfigChanged=Mock(),
             )
             def enter(sample, upper):
-                meters = (sample - backend.radarZeroSample) * backend.radarMetersPerSample
+                meters = (sample - (backend.radarZeroSample - np.ceil(backend.radarZeroSample))) * backend.radarMetersPerSample
                 self.assertTrue(Analyzer.setRadarRangeMeters(backend, meters, upper))
 
             enter(20.4, False)

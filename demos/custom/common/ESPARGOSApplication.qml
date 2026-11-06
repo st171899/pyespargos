@@ -36,6 +36,7 @@ ApplicationWindow {
 	color: "#11191e"
 	title: "ESPARGOS Demo"
 	property bool tooltipsEnabled: true
+    property bool receiverControlsOnRight: false
 	property string receiverDrawerLabel: "⚙ RX"
 
 	function showError(title, message) {
@@ -48,6 +49,7 @@ ApplicationWindow {
 	header: ToolBar {
 		id: header
 		RowLayout {
+            layoutDirection: root.receiverControlsOnRight ? Qt.RightToLeft : Qt.LeftToRight
 			anchors.fill: parent
 
 			ToolButton {

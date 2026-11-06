@@ -29,7 +29,7 @@ Common.ESPARGOSApplication {
         id: rangeField
         required property bool upperBound
         readonly property real sample: upperBound ? backend.delayMax : backend.delayMin
-        readonly property real meters: (sample - backend.radarZeroSample) * backend.radarMetersPerSample
+        readonly property real meters: (sample - backend.radarDisplayZeroSample) * backend.radarMetersPerSample
         enabled: isFinite(backend.radarZeroSample)
         placeholderText: "Calibrate range first"
         Layout.fillWidth: true
@@ -68,6 +68,7 @@ Common.ESPARGOSApplication {
 	/** RX drawer: the reusable IQ capture settings (replaces the CSI pool drawer) **/
 	receiverDrawerComponent: Component {
 		IQ.IQRxDrawer {
+            objectName: "radarRxDrawer"
 			controller: iqcontrol
             enabled: !backend.txBusy
 		}
@@ -886,7 +887,7 @@ Common.ESPARGOSApplication {
 								const radius = gridOverlayCanvas.plotRadius;
                                 const totalSamples = delay_max - delay_min;
                                 const metersPerSample = backend.radarMetersPerSample;
-                                const zero = backend.radarZeroSample;
+                                const zero = backend.radarDisplayZeroSample;
                                 if (radius <= 0) return;
                                 const rangeStart = (delay_min - zero) * metersPerSample;
                                 const rangeEnd = (delay_max - zero) * metersPerSample;

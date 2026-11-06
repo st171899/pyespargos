@@ -32,6 +32,16 @@ The receive drawer supports mixed TX/RX boards and updates only receive sensors;
 TX-only boards retain their settings. Accumulation displays use unwrapped
 sample indices and the active board's generation, including partial captures.
 
+On ESPARGOS radar exit (including Ctrl+C), shutdown waits for in-flight TX and
+calibration work, mutes transmission, and disables the reference source. Every
+sensor, including RX-only calibration helpers, is brought into RX with a
+temporary interval trigger and given an acknowledged silent 1024-sample replay.
+This replaces retained user waveforms with a known recipe that the next
+calibration can resize and restore. Shutdown restores the capture trigger and
+confirms WiFi mode before closing connections. Cleanup failures are logged and
+do not prevent attempts on the remaining boards. Forced termination or an
+unreachable board can still prevent this hardware cleanup.
+
 The earlier entry points under `adjusted_demos` also use the native receiver
 and current QML paths. Their independent processing behavior is retained; use
 this directory's pulse analyzers for the current radar feature set.
@@ -411,39 +421,6 @@ Compiled `.qsb` shaders are included. After editing the GLSL sources, run
 The heatmap requires a graphics backend that supports Qt Quick ShaderEffect;
 Mesa software OpenGL works, whereas Qt Quick's `software` backend does not.
 
-## Regression test
-
-The test exercises processing with and without calibration and TX, partial
-arrays, the initial empty display, texture updates, and window resizing. It
-uses the actual QML and synthetic data without connecting to radio hardware.
-On headless Linux with Xvfb and Mesa installed:
-
-```sh
-QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
-    python demos/custom/pulse-radar-analyzer/tests/test_radar_rendering.py
-```
-
-The focused processing checks run without a display or radio hardware:
-
-```sh
-python demos/custom/pulse-radar-analyzer/tests/test_radar_processing.py
-```
-
-The lecture-equation and analytic array-response checks are:
-
-```sh
-python demos/custom/pulse-radar-analyzer/tests/test_beamforming.py
-```
-
-The ESPARGOS transmission and UI checks run without radio hardware:
-
-```sh
-python demos/custom/pulse-radar-analyzer/tests/test_espargi_tx.py
-python demos/custom/pulse-radar-analyzer/tests/test_reciprocity_helpers.py
-python demos/custom/pulse-radar-analyzer/tests/test_rx_refinement.py
-QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
-    python demos/custom/pulse-radar-analyzer/tests/test_espargi_ui.py
-```
 
 ## ESPARGOS range–Doppler processing
 
@@ -454,12 +431,26 @@ complete-only controls are hidden in map views because they do not control
 Doppler resolution or map sample selection. Observation and velocity controls
 are shown only in the Doppler view. Exact velocity bounds accept nine decimals.
 
-The processor uses every acquired raw burst chunk at its actual source sample
-time. It evaluates trial Doppler phase on the IQ samples before correlating
-with the submitted, RX-resampled periodic transmit reference. Missing antenna
-samples are masked, not treated as measurements of zero. The fixed processing
-path uses RX calibration, Hann time weighting and coherent combination, then
-takes the strongest horizontal receive beam at each range/velocity cell.
+The processor range-matches each received pulse once against the submitted,
+RX-resampled periodic transmit reference. It then estimates Doppler from the
+complex matched-filter phase across pulses at each range bin. A trial velocity
+changes only this slow-time phase, not the samples within a pulse. Every valid
+received chunk and every pulse within that chunk contributes; adjacent chunks
+covering one longer pulse are joined. Missing antenna/sample observations have
+zero coverage weight rather than becoming measurements of zero.
+
+For regular schedules, a chirp-Z transform evaluates the existing velocity
+limits efficiently. Short lattices group the same pulse position across bursts,
+so large inter-burst gaps do not require a huge zero-filled pulse array. Missing
+slots have zero weight. Irregular schedules use a tiled timestamped DFT of the
+same matched-filter profiles. Both paths preserve source time and agree with a
+direct slow-time Fourier sum. Hann slow-time weighting and coherent receive
+beamforming produce the strongest horizontal beam at each range/velocity cell.
+
+There is no intra-pulse Doppler compensation or range-migration correction.
+Long chirps/high Doppler can therefore suffer ordinary matched-filter loss and
+range–Doppler coupling. The former sample-domain trial-velocity engine and its
+experimental amplitude-inversion/migration routines have been removed.
 
 Observation time limits the age of retained measurements; the internal buffer
 holds at most 1024 chunks/lanes. Processing starts with the first valid capture.
@@ -483,8 +474,12 @@ attenuates stationary and nearby slow returns. Disable it when testing static
 target range. In Doppler processing, incomplete firmware averaging windows are
 discarded rather than fitted with an unknown response. Use Interval capture
 to retain individual pulse information. Complete accumulated lanes retain their
-actual positions and use the known complex averaging response. Averaging nulls
-remain blind; the UI does not offer noise-amplifying amplitude inversion.
+actual source positions. Their matched-filter profiles are timestamped at the
+averaging centroid. Known aligned averaging responses provide phase/sign
+alignment only; their measured attenuation is retained. Averages that mix
+waveform phases are reported as such. Averaging nulls remain blind, and no
+amplitude inversion is applied. Individual pulses averaged away by firmware
+are not recreated as independent slow-time observations.
 
 The experimental processing selector, capture-cadence compatibility FFT,
 burst power averaging, window selector, manual grid/history budgets, partial-
@@ -492,8 +487,8 @@ coverage approximation, averaging-loss correction/floor, velocity presets, and
 range-migration toggle have been removed from the normal settings. They added
 choices without a dependable benefit in the tested hardware workflow. The
 single coherent path and observation time replace those overlapping controls.
-The low-level numerical routines remain covered by regression tests; they are
-not advertised as hardware-validated operating modes. The validated simulator
+The pulse-phase processing path is covered by numerical and UI regression
+tests. The historical simulator
 scene keeps delay fixed while applying Doppler independently. The displayed map
 assumes a fixed delay during its observation; shorten the observation for real
 targets that traverse range cells. Actual aircraft tracking/range migration is
@@ -512,14 +507,14 @@ For carrier fc, wavelength lambda=c/fc and coherent aperture T:
   `lambda/(2*Tgap)` apart. At 80 MSa/s, 2.4 GHz and actual K=8192 this is
   approximately 2.383 m/s. The often-quoted half interval, ±1.191 m/s, is the
   Nyquist interval for one uniformly sampled value per burst, not a guarantee
-  for this gapped, within-burst IQ processor. Unequal coverage and a finite
+  for this gapped pulse-phase processor. Unequal coverage and a finite
   velocity grid can change which aliases are visible or strongest. Requested
   firmware cadence alone is insufficient to label an unambiguous band.
   Reducing gaps and increasing burst coverage add information. A longer
   observation sharpens peaks without removing periodic aliases.
 * Pulse-to-pulse sampling has the reference Nyquist interval
   `±lambda/(4*PRI)`. Sparse capture cadence introduces additional aliases even
-  when within-chirp IQ is retained. Raising plot limits does not resolve them.
+  when every received pulse is used. Raising plot limits does not resolve them.
 * Search-grid spacing is `(velocity_max-velocity_min)/(points-1)` and adds no
   physical information beyond the acquired samples.
 * Equivalent monostatic range is `c*(delay-delay_zero)/2`. RX sample spacing is
@@ -537,27 +532,13 @@ the replacement is ready, so the existing shaders never sample an empty image
 between updates. Waiting for IQ or clutter warm-up also retains the previous
 map. They do not send individual pixel values through QML. Only the
 latest texture is retained, avoiding a queue of large frame payloads.
-The Doppler worker reuses weighted history buffers across velocity tiles,
-uses a direct contraction without BLAS thread spawning, computes repeated
-range lags once, and caps the automatic grid at 513 velocities. It yields
-between tiles, cancels stale searches after view/limit changes, and rests at
-least 200 ms after a search. Narrow velocity bounds improve grid spacing;
-all selected bounds are still evaluated. These controls bound processing
-work but do not establish that every possible application hang is resolved.
+The Doppler worker performs range filtering once per pulse, then uses a fast
+slow-time chirp-Z transform where the timestamps permit it. Its irregular-grid
+fallback uses direct contractions without BLAS thread spawning. It computes
+repeated range lags once and caps the automatic grid at 513 velocities. It
+yields between transform tiles, cancels stale searches after view/limit changes,
+and rests at least 200 ms after a search.
 
-In the ESPARGOS analyzer, Ping/time, angle of arrival and range–angle
-zero-Doppler removal use a mean of up to 64 coherent received
-chunks and start after two observations. Missing antennas are excluded from
-the mean rather than filled with zero; late pieces of the newest chunk can
-complete that observation. It learns chunks independently of
-the requested burst offset and keeps its history through reception gaps.
-Rate, RF, calibration and capture-epoch changes still clear it. This history
-is not used as a uniform Doppler FFT. Subtraction happens in raw IQ before
-Ping correlation or AoA matched filtering and beamforming; longer display
-windows use the repeated 256-sample background template. This applies only
-to `pulse-radar-analyzer-espargi`; the other demos retain their own processing.
-Static and rolling clutter modes retain
-their existing behavior.
 
 ### Accumulation source timestamps
 
@@ -570,128 +551,5 @@ window and leaves the plot waiting for timestamp data.
 For sparse accumulation, the analyzer verifies candidate regular source
 positions against the packet's coverage fingerprint before assigning the
 first sample timestamp and averaging step. It models averaging with that
-verified step, preserving its real attenuation/null velocities. Full-coverage
-windows keep their existing path. Incomplete, inconsistent or unidentified
-coverage is still rejected and now reports why, while retaining the last map.
-A replay of 2214 distinct complete windows from a saved hardware metadata
-capture verified eight-chunk spacing in every case. This replay validates
-metadata interpretation, not a new live Doppler-accuracy measurement.
+verified step, preserving its real attenuation/null velocities.
 
-### Calibration setup mismatches
-
-`Selected IQ sensors require one frequency and RX sample rate` is a setup
-validation failure before pilot acquisition. Its diagnostic lists the selected
-sensors, carrier and RX sample rate on each board. `selected TX=[]` means the
-app requested RX-only calibration of all sensors, including any former TX
-board. The RX drawer skips TX-only boards, so their stored ADC rate can differ
-from the active receivers. The radar setup now aligns all boards that will
-receive to the first existing receiver's rate when applying roles; it leaves
-TX-only ADC settings alone. For radar transmission, select the intended TX
-sensors in the app before running Sync + Calibration.
-
-### Hardware validation, 29 October 2026
-
-Simulator: `192.168.4.1`, hardware mode, 160 MSa/s digital processing,
-20 MHz RX/TX RF bandwidth, nominal 2.4 GHz carrier (readback 2399999998 Hz).
-Its reported fixed delay was 0.325 us, marked **not latency-calibrated**.
-ESPARGOS RX/TX were `10.42.0.35` and `10.42.0.204`, using the configured reference
-cables. The chirp had 20 MHz bandwidth, 64 active samples, one pulse per 256
-samples at 80 MSa/s; TX RF bandwidth was 20 MHz. The clipping-free sweep used
-36 dB ESPARGOS RX gain, simulator RX gain 20 dB and target gain -6 dB. The
-ESPARGOS receive filter remained at its original 40 MHz for this sweep; the
-transmitted and simulator-limited echo bandwidth was 20 MHz. Calibration kept
-its normal independent correlation, coherence and phase-residual checks.
-
-An additional attempt with the ESPARGOS receive filter at 20 MHz did not
-complete calibration. Temporarily widening the filter for coarse reference
-onset detection fixed that stage and allowed RX phase calibration, but TX
-reciprocity did not establish clean links. The monitor alternative also failed
-to identify a consistent pilot origin. These attempts produced no measurement
-sweep and are not included in the tables. The calibration fixes retain filter
-restoration and omit invalid empty transmitter updates on RX-only boards;
-independent calibration quality thresholds remain unchanged.
-
-Interval capture used K=8192, burst=3. A prior burst=16 pilot delivered only
-three consecutive chunks per interval. The final sweep recorded 17 scenes:
-six delays, eight nonzero velocities, and three muted references. All 1568
-array chunks were complete, simulator clipping was false throughout, and the
-largest raw ESPARGOS ADC component was 254 against full scale 512. A preceding
-high-gain run flagged simulator clipping and was excluded from these results.
-
-Offline verification used the same IQ phase/time correction and sample-domain
-processor, quiet-scene background subtraction and a fixed ±12 m direct-path
-exclusion, independent of target commands. The search covered ±350 m/s on a
-0.5 m/s grid. Four real captures were also replayed through the simplified
-application's acquisition/render path, with its 250 ms observation and automatic
-grid, showing the expected echo near 123–125 m.
-
-| Added delay | Expected displayed range | Measured displayed range |
-| ---: | ---: | ---: |
-| 0 us | 48.716 m | 49.707 m |
-| 0.25 us | 86.190 m | 87.181 m |
-| 0.5 us | 123.664 m | 124.656 m |
-| 1 us | 198.613 m | 199.604 m |
-| 2 us | -131.159 m | -130.168 m |
-| 3 us | 18.737 m | 19.728 m |
-
-Every delay change tracked correctly. The approximately +0.99 m common offset
-is relative to the simulator's uncalibrated latency report, not a claim of
-one-meter absolute accuracy. The 2 us and 3 us cases demonstrate the expected
-range wrapping. This is a single-target peak-location test, not a measured
-two-target resolution test.
-
-| Programmed equivalent velocity | Strongest measured velocity candidate |
-| ---: | ---: |
-| -300 m/s | -340.5 m/s |
-| -100 m/s | -140.5 m/s |
-| -10 m/s | -10 m/s |
-| -2 m/s | -2 m/s |
-| +2 m/s | -38.5 m/s |
-| +10 m/s | +10 m/s |
-| +100 m/s | +100 m/s |
-| +300 m/s | +340.5 m/s |
-
-The programmed component was present in every Doppler case, but absolute
-velocity was **not uniquely validated**. Four of eight nonzero cases selected
-a competing alias as the largest peak; those aliases exceeded the commanded
-response by only 0.0009–0.0142 dB. The capture cadence gives approximately
-2.383 m/s alias spacing; the 0.5 m/s evaluation grid highlighted near-degenerate
-candidates approximately 40.5 m/s apart. A fine aperture spacing near 0.08 m/s
-did not remove that ambiguity. The UI now describes competing candidates
-instead of advertising a waveform Nyquist bound as a demonstrated capability.
-
-For this hardware, start with Interval capture, K=8192, burst=3, 250 ms
-observation, and clutter removal off while checking target range. At 2.4 GHz,
-100/250/500/1000 ms correspond to ideal aperture spacings of approximately
-0.625/0.250/0.125/0.0625 m/s when the full observation is populated. Shorter
-observations reduce motion smearing; at 300 m/s a target crosses a nominal
-7.5 m range cell in 25 ms, so even the 100 ms setting can smear an aircraft. The additional 5–25 ms choices reduce
-that smearing, but a window shorter than the interval between bursts can contain
-only one burst and provide much less Doppler resolution.
-The current fixed-delay processor is not validated for tracking
-that motion. Longer observations help distinguish nearby Doppler components
-in fixed-delay scenes but do not remove capture-cadence aliases. Use a broad
-velocity search to inspect competing peaks before narrowing bounds. Interval
-capture avoids firmware averaging nulls; accumulation sacrifices Doppler
-information before the host receives it. Use rolling or static clutter removal
-only after checking the unsuppressed scene, and zero-Doppler suppression only
-when stationary/slow returns are expendable.
-
-Both ESPARGOS boards' original IQ settings/modes were restored, TX was muted,
-and the simulator's original carrier, gains and target scene were restored.
-Temporary scripts and raw captures were removed at the user's request; this
-summary retains the setup, results and limitations.
-
-Hardware-free regression checks (each Qt test owns its own process):
-
-```sh
-python demos/custom/pulse-radar-analyzer/tests/test_sample_radar.py
-python demos/custom/pulse-radar-analyzer/tests/test_calibration_recovery.py
-QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
-    python demos/custom/pulse-radar-analyzer/tests/test_sample_radar_ui.py
-QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
-    python demos/custom/pulse-radar-analyzer/tests/test_espargi_ui.py
-# Requires a graphics-capable display:
-QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1 \
-    python demos/custom/pulse-radar-analyzer/tests/test_doppler_rendering.py
-```

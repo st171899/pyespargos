@@ -155,6 +155,22 @@ class DisplayProcessingTest(unittest.TestCase):
                 expected = (module.matplotlib.colormaps['viridis'](np.clip(norm, 0, 1))*255).astype(np.uint8)
                 np.testing.assert_array_equal(module.power_pixels(power, lower, upper, linear), expected)
 
+class RadarCalibrationBatchTest(unittest.TestCase):
+    def test_matches_individual_calibration_with_missing_and_short_traces(self):
+        rng = np.random.default_rng(13)
+        for fft_size in (256, 1024):
+            corrections = {a: np.exp(1j*(a*.13 + np.linspace(-.3,.4,fft_size))).astype(np.complex64) for a in range(7)}
+            backend = SimpleNamespace(fft_size=fft_size, active_board=0,
+                _rx_sensor_ids=lambda: tuple(range(8)),
+                iqcontrol=SimpleNamespace(cal_correction=lambda b,a,n:corrections.get(a)))
+            rows = [(i, {a:(rng.normal(size=180+i%77)+1j*rng.normal(size=180+i%77)).astype(np.complex64) for a in range(8) if (a+i)%5}) for i in range(35)]
+            batch = Analyzer._angle_corrected_batch(backend, rows)
+            for index, traces in rows:
+                expected,_ = Analyzer._angle_fine_corrected_traces(backend, traces)
+                self.assertEqual(set(batch[index]), set(traces))
+                for a,t in traces.items():
+                    np.testing.assert_allclose(batch[index][a], expected[a,:len(t)], rtol=2e-6, atol=2e-6)
+
 
 if __name__ == '__main__':
     unittest.main()

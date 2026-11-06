@@ -98,10 +98,12 @@ class SampleRadarUITest(unittest.TestCase):
             self.assertEqual(list(app._sample_radar.records), indices)
             self.assertEqual(len(frames), 1)
             self.assertEqual((app.dopplerDataMinimum, app.dopplerDataMaximum), (200, 400))
-            self.assertIn('Coherent Doppler', app.radarStatus)
+            self.assertIn('Pulse Doppler', app.radarStatus)
+            self.assertIn('16 matched pulses', app.radarStatus)
             self.assertIn('Capture-gap aliases ≈ 9.53 m/s apart', app.dopplerProcessingInfo)
             self.assertIn('no guaranteed unambiguous band', app.dopplerProcessingInfo)
-            rgba = np.asarray(frames[-1]).reshape(256, app.angleSize, 4)
+            self.assertEqual(app.delaySize, 128)  # Two pings: one unambiguous period.
+            rgba = np.asarray(frames[-1]).reshape(app.delaySize, app.angleSize, 4)
             peak = np.unravel_index(np.argmax(rgba[:, :, 1]), rgba.shape[:2])
             self.assertGreaterEqual(int(rgba[23, app.angleSize//2, 1]), int(rgba[:, :, 1].max())-1)
             self.assertIn(peak[0], [23, 151])
@@ -143,6 +145,7 @@ class SampleRadarUITest(unittest.TestCase):
             cluster._completion = np.ones((1,2,4),bool)
             cluster._section_completion = np.ones((1,2,4,1),bool)
             cluster._counts = np.full((1,2,4,1),1024,np.int32)
+            cluster._flags = np.zeros((1,2,4,1),np.uint32)
             cluster._coverage_hashes = np.full((1,2,4,1),4125752773,np.uint32)
             source = cluster.chunk_index*256+np.arange(256)
             fd = -2*2.4e9/module.espargos.constants.SPEED_OF_LIGHT
@@ -157,7 +160,7 @@ class SampleRadarUITest(unittest.TestCase):
             record = app._sample_radar.records[cluster.chunk_index]
             self.assertEqual(record[2:4],(1024,2048))
             self.assertEqual(len(frames),before+1)
-            self.assertIn('Coherent Doppler',app.radarStatus)
+            self.assertIn('Pulse Doppler',app.radarStatus)
             self.assertNotIn('Waiting for sample-timestamp',app.dopplerProcessingInfo)
             rgba = np.asarray(frames[-1]).reshape(app.delaySize,app.angleSize,4)
             self.assertGreater(int(rgba[23,:,1].max()),1)
@@ -169,6 +172,38 @@ class SampleRadarUITest(unittest.TestCase):
             app._render_block_rows(app._drain_sets(),'doppler')
             self.assertFalse(app._sample_radar.records)
             self.assertIn('source coverage cannot be identified',app.dopplerProcessingInfo)
+            # Radar publishes an entire validated batch atomically and never
+            # mixes observations across the streaming dead time.
+            import copy
+            app._display_config = dict(trigger=dict(mode='radar', vector_chunks=1,
+                interval_chunks=24, offset_chunks=0, pulses=3, cycle_windows=10))
+            def radar_cluster(w, bad=False):
+                c = copy.deepcopy(cluster)
+                c.window_index = w
+                c.chunk_index = c.source_chunk_start = w*24
+                c.source_chunk_end = c.source_chunk_start+24
+                c.nominal_chunks = 8
+                c.config_generation[:] = 5
+                c._counts[:] = 8
+                c._flags[:] = 259 if bad else 256
+                h = 2166136261
+                for x in range(w*24,w*24+8): h = ((h^x)*16777619)&0xffffffff
+                c._coverage_hashes[:] = h
+                return c
+            app._pending_clusters = [(time.monotonic()-1,radar_cluster(w)) for w in (2,0)]
+            self.assertEqual(app._drain_sets(), [])
+            app._pending_clusters = [(time.monotonic()-1,radar_cluster(1))]
+            ready = app._drain_sets()
+            self.assertEqual([i for i,_ in ready],[0,24,48])
+            app._render_block_rows(ready,'doppler')
+            self.assertEqual(len(app._sample_radar.records),3)
+            app._pending_clusters = [(time.monotonic()-1,radar_cluster(w,w==11)) for w in (10,11,12)]
+            self.assertEqual(app._drain_sets(), [])
+            self.assertEqual(len(app._sample_radar.records),3)
+            app._pending_clusters = [(time.monotonic()-1,radar_cluster(w)) for w in (20,21,22)]
+            app._render_block_rows(app._drain_sets(),'doppler')
+            self.assertEqual(list(app._sample_radar.records),[480,504,528])
+            app._display_config = {}
             # A live search must let the Qt event loop run and let changed
             # limits cancel it before publishing an obsolete map.
             app._sample_radar.clear()

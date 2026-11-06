@@ -8,7 +8,7 @@ from espargos import Antenna
 from espargos.board import EspargosHTTPStatusError
 from espargos.calibration import CalibrationState
 from espargos._iq_calibration.reference import _map
-from espargos.iq_tx_control import _rpc, _waveform
+from espargos.iq_tx_control import _rpc, _wait, _waveform
 from espargos.steering import Beamspace
 from espargos.waveforms import IQSamples
 from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
@@ -17,6 +17,64 @@ from espargos.iq_tx_rx_delay import TxRxDelayMeasurementError
 def air_path_delays(transmitters, receivers):
     """Establish range zero from direct coupling, neglecting propagation time."""
     return {(tx, rx): 0.0 for tx in transmitters for rx in receivers}
+
+
+def reset_radar_boards(pool, timeout=10):
+    """Replace dormant replays with known silence, then hand every board to WiFi.
+
+    Muting or switching to WiFi alone retains replay buffers. Calibration can
+    later need to resize those buffers, including ones on receive-only helpers.
+    Reset in RX after fresh chunks prove the engines have finished restarting;
+    never temporarily enable TX. Keep connections alive for acknowledgements.
+    """
+    def reset(board):
+        errors = []
+        subscription = None
+        saved_trigger = None
+        try:
+            _rpc(board, "set_iq_tx", {"muted": True})
+            board.iq.set_reference()
+            saved_trigger = board.iq.get_config()["trigger"]
+            generation = None
+            seen, ready = set(), threading.Event()
+
+            def receive(message):
+                if message.payload.config_generation == generation:
+                    seen.add(message.antenna_id)
+                    if seen.issuperset(range(8)):
+                        ready.set()
+
+            subscription = board.iq.subscribe_chunks(receive)
+            board.iq.set_config({"modes": ["iq_rx"] * 8, "trigger": dict(mode="interval", interval_chunks=8192, burst_chunks=1)})
+            generation = board.iq.get_config()["config_generation"]
+            if not ready.wait(timeout):
+                raise TimeoutError(f"{board.host}: sensors {sorted(set(range(8)) - seen)} did not become ready for shutdown replay reset")
+            _waveform(board, dict(type="cw", frequency_hz=0, samples=1024, amplitude=0, antennas=list(range(8))), timeout)
+        except Exception as error:
+            error.add_note(f"{board.host}: shutdown replay reset failed")
+            errors.append(error)
+        finally:
+            # Each cleanup is independent: one unreachable board or failed
+            # unsubscribe must not prevent the others from returning to WiFi.
+            if subscription is not None:
+                try:
+                    board.iq.unsubscribe(subscription)
+                except Exception as error:
+                    errors.append(error)
+            try:
+                config = {"modes": ["wifi"] * 8}
+                if saved_trigger is not None:
+                    config["trigger"] = saved_trigger
+                board.iq.set_config(config)
+                _wait(board, lambda state: all(s["applied_mode"] == "wifi" and not s["enabled"] for s in state["sensors"]), timeout)
+            except Exception as error:
+                error.add_note(f"{board.host}: could not confirm WiFi shutdown")
+                errors.append(error)
+        return errors
+
+    errors = [error for result in _map(reset, pool.boards) for error in result]
+    if errors:
+        raise ExceptionGroup("Radar board shutdown incomplete", errors)
 
 
 def calibrate_radar_timing(pool, transmitters, path, logger):

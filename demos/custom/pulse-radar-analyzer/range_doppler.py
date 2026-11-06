@@ -1,9 +1,8 @@
-"""Sample-timestamp delay/Doppler matched filtering for sparse IQ captures.
+"""Pulse-matched range profiles and timestamped slow-time Doppler processing.
 
-All acquired samples are used. Gaps are neither interpolated nor time-compressed.
-For accumulated vectors the trial waveform is averaged at the same repetition
-spacing as the firmware. This models phase AND amplitude loss before reception;
-nulls do not become recoverable by changing host processing.
+All acquired chunks are used within the bounded observation history. Range
+matching runs once per pulse; velocity uses only pulse-to-pulse complex phase.
+Capture gaps stay on the source time grid. Firmware averaging losses remain.
 """
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -25,6 +24,8 @@ class RadarResult:
     period_samples: int
     minimum_response: float
     partial_accumulations: int
+    pulses: int = 0
+    averaging_aligned: bool = True
 
 
 def accumulation_response(frequency_hz, count, step_seconds):
@@ -64,42 +65,87 @@ def accumulation_layout(source_start, source_end, vector, nominal, lane, coverag
     if span % nominal == 0:
         steps.add(span//nominal)
     for step in sorted(steps):
-        offsets = {lane}
+        # Current firmware fingerprints vector starts, so every section
+        # shares the hash although its samples start lane chunks later.
+        # Also accept verified section-specific fingerprints from older data.
+        candidates = [(0,lane),(lane,lane)]
         if step % vector == 0:
-            offsets.add(lane*(step//vector))
-        for offset in sorted(offsets):
-            if offset+(nominal-1)*step >= span:
+            offset = lane*(step//vector)
+            candidates.append((offset,offset))
+        for hash_offset,source_offset in dict.fromkeys(candidates):
+            if source_offset+(nominal-1)*step >= span:
                 continue
             fingerprint = 2166136261
             for q in range(nominal):
-                index = (int(source_start)+offset+q*step) & 0xffffffff
+                index = (int(source_start)+hash_offset+q*step) & 0xffffffff
                 fingerprint = ((fingerprint ^ index)*16777619) & 0xffffffff
             if fingerprint == int(coverage_hash):
-                return offset, step
+                return source_offset, step
     return None
 
 
-def migration_terms(data, weights, times, fd, velocity, sample_rate, offsets, reference_time):
-    """Align pulse profiles to the common aperture midpoint for each velocity.
+def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancelled=None):
+    """Timestamped pulse-phase transform, using short regular burst lattices.
 
-    Delay changes by 2*v*dt/c. The shift is constant over each replay period
-    (evaluated at its center); Doppler phase within every sample is still exact.
-    For long replays this is a narrowband, stop-and-hop range-walk approximation.
+    A CZT evaluates the requested uniform frequency grid without allocating
+    the huge zero-filled pulse lattice across inter-burst gaps. Missing slots
+    in each small burst-phase lattice have zero weight, not synthetic data.
+    Irregular schedules/nonuniform frequency grids use an exact tiled DFT.
     """
-    period = data.shape[-1]
-    numerator_fft = np.zeros((len(fd), 8, period), np.complex128)
-    coverage_fft = np.zeros_like(numerator_fft)
-    phase = np.exp(-2j*np.pi*fd[:, None]*np.arange(period)[None]/sample_rate)
-    for begin in range(0, len(times), 16):
-        t = times[begin:begin+16]
-        dt = t+(period-1)/(2*sample_rate)-reference_time
-        shift = np.exp(2j*np.pi*(2*velocity/C)[:, None, None]*dt[None, :, None]*offsets[None, None])
-        carrier = np.exp(-2j*np.pi*fd[:, None]*t[None])
-        values = data[begin:begin+16]*weights[begin:begin+16]
-        spectra = np.fft.fft(values[None]*phase[:, None, None, :])
-        numerator_fft += np.einsum('vrm,vram->vam', shift*carrier[:, :, None], spectra, optimize=False)
-        coverage_fft += np.einsum('vrm,ram->vam', shift, np.fft.fft(weights[begin:begin+16]), optimize=False)
-    return numerator_fft, coverage_fft
+    from scipy.signal import CZT
+
+    profiles = np.asarray(profiles, np.complex64)
+    frequencies = np.asarray(frequencies, np.float64)
+    times = np.asarray(times, np.float64)
+    result = np.zeros((len(frequencies), *profiles.shape[1:]), np.complex128)
+    if not len(frequencies):
+        return result
+    ticks = np.rint(times*sample_rate*2).astype(np.int64)
+    unique = np.unique(ticks)
+    lattice = None
+    uniform = len(frequencies) > 1 and np.allclose(np.diff(frequencies), frequencies[1]-frequencies[0], rtol=1e-8, atol=1e-10)
+    exact_ticks = np.allclose(times*sample_rate*2,ticks,rtol=0,atol=1e-4)
+    if len(unique) >= 8 and len(frequencies) >= 16 and uniform and exact_ticks:
+        gaps = np.diff(unique)
+        starts = unique[np.r_[True, gaps > 3*period]]
+        cadence = int(np.gcd.reduce(np.diff(starts if len(starts) > 1 else unique)))
+        if cadence > 0:
+            phases = np.unique(ticks % cadence)
+            if len(phases) <= 32:
+                candidates = []
+                for phase in phases:
+                    ids = np.flatnonzero(ticks % cadence == phase)
+                    first = ticks[ids].min()
+                    slots = (ticks[ids]-first)//cadence
+                    candidates.append((ids,slots,int(slots.max())+1,first/(2*sample_rate)))
+                if max(c[2] for c in candidates) <= 4096 and sum(c[2] for c in candidates) <= 4*len(times):
+                    lattice = candidates, cadence/(2*sample_rate)
+    if lattice is not None:
+        groups, dt = lattice
+        step = frequencies[1]-frequencies[0]
+        transforms = {}
+        for ids, slots, size, first in groups:
+            if size not in transforms:
+                transforms[size] = CZT(size,m=len(frequencies),
+                    w=np.exp(-2j*np.pi*step*dt),a=np.exp(2j*np.pi*frequencies[0]*dt))
+            transform = transforms[size]
+            rotation = np.exp(-2j*np.pi*frequencies*first)
+            for begin in range(0,profiles.shape[-1],64):
+                if cancelled is not None and cancelled():
+                    return None
+                time.sleep(0)
+                end = min(begin+64,profiles.shape[-1])
+                grid = np.zeros((size,profiles.shape[1],end-begin),np.complex64)
+                np.add.at(grid,slots,profiles[ids,:,begin:end])
+                result[:,:,begin:end] += transform(grid,axis=0)*rotation[:,None,None]
+        return result
+    for begin in range(0,len(frequencies),16):
+        if cancelled is not None and cancelled():
+            return None
+        time.sleep(0)
+        phase = np.exp(-2j*np.pi*frequencies[begin:begin+16,None]*times[None]).astype(np.complex64)
+        result[begin:begin+16] = np.einsum('vp,pad->vad',phase,profiles,optimize=False)
+    return result
 
 
 class SampleRadar:
@@ -112,7 +158,7 @@ class SampleRadar:
         self.records.clear()
 
     def append(self, index, traces, *, count=1, step=0, capture=None, partial=False):
-        if self.records and index < min(self.records) and len(self.records) >= self.size:
+        if self.records and index < next(iter(self.records)) and len(self.records) >= self.size:
             return False
         data = np.zeros((8, 256), np.complex64)
         valid = np.zeros((8, 256), bool)
@@ -133,8 +179,10 @@ class SampleRadar:
             data = np.where(added, data, old_data)
             valid = valid | old_valid
             partial = partial or old_partial
+        reorder = bool(self.records) and index < next(reversed(self.records))
         self.records[int(index)] = (data, valid, max(1, int(count)), int(step), capture, bool(partial))
-        self.records = OrderedDict(sorted(self.records.items()))
+        if reorder:
+            self.records = OrderedDict(sorted(self.records.items()))
         while len(self.records) > self.size:
             self.records.popitem(last=False)
         return True
@@ -175,7 +223,7 @@ class SampleRadar:
         cadence = int(np.gcd.reduce(np.diff(starts)))
         return C*sample_rate/(2*frequency*cadence*256) if cadence > 1 else None
 
-    def _rows(self, reference, sample_rate, mode, window, suppress, max_age):
+    def _rows(self, reference, sample_rate, mode, max_age):
         records = list(self.records.items())
         if not records:
             return None
@@ -212,125 +260,100 @@ class SampleRadar:
         data = np.asarray([rows[k][0] for k in keys])
         valid = np.asarray([rows[k][1] for k in keys])
         times = np.asarray([k[3]*period-first for k in keys], np.float64)
-        centers = times[:, None] + np.arange(period)[None] + np.asarray([(k[1]-1)*k[2]/2 for k in keys])[:, None]
+        centers = times+np.asarray([(k[1]-1)*k[2]/2 for k in keys])
         weight = valid.astype(np.float32)
         coherent = 0.0
         for group in sorted(set(k[0] for k in keys)):
             members = np.asarray([k[0] == group for k in keys])
-            good = valid[members].any(axis=1)
-            a, b = centers[members][good].min(), centers[members][good].max()+1
-            coherent = max(coherent, (b-a)/sample_rate)
-            if window == 'hann' and b-a > 1:
-                # A raised cosine on actual time, not ordinal record number.
-                taper = np.sin(np.pi*(centers[members]-a+0.5)/(b-a))**2
-                weight[members] *= taper[:, None, :]
-        if suppress:
-            total = weight.sum(axis=0)
-            mean = np.divide((weight*data).sum(axis=0), total, out=np.zeros_like(total, dtype=np.complex128), where=total > 0)
-            data = (data-mean[None]).astype(np.complex64)
+            row,phase = np.nonzero(valid[members].any(axis=1))
+            observed = centers[members][row]+phase
+            coherent = max(coherent,(observed.max()-observed.min()+1)/sample_rate)
         partial = sum(int(r[-1]) for _, r in records)
         return keys, data, weight, times/sample_rate, (end-first)/sample_rate, coherent, int(sum(r[1].sum() for _, r in records)), partial
 
     def maps(self, reference, sample_rate, frequency, velocities, delays, geometry,
-             *, mode='coherent', window='hann', suppress=False, compensate=False,
-             response_floor_db=-20, max_age=0, spacing_m=0.06, migration=False, cancelled=None):
-        """Matched filter over the requested velocity grid, tiled for bounded memory.
+             *, mode='coherent', window='hann', suppress=False, max_age=0,
+             spacing_m=0.06, cancelled=None):
+        """Range match once per pulse, then combine matched-filter slow-time phases.
 
-        Demodulate each raw IQ sample for each trial Doppler BEFORE range
-        correlation. This retains intra-pulse Doppler information and avoids
-        range/Doppler coupling introduced by a zero-Doppler-only correlator.
-        'bursts' combines contiguous runs in power; 'coherent' combines all
-        records using their true timestamps, including gaps.
+        Every acquired chunk/verified averaged lane contributes. Pulses split
+        across chunks are joined; multiple pulses per chunk stay separate.
+        No trial-velocity phase correction is applied within a pulse.
         """
-        if mode not in ('coherent', 'bursts') or window not in ('hann', 'rectangular'):
+        if mode not in ('coherent','bursts') or window not in ('hann','rectangular'):
             raise ValueError('Unknown Doppler strategy or time window')
         if sample_rate <= 0 or frequency <= 0:
             raise ValueError('Sample rate and RF frequency must be positive')
-        geometry = np.asarray(geometry, int)
         reference = minimal_replay(reference)
-        prepared = self._rows(reference, sample_rate, mode, window, suppress, max_age)
+        # Slow-time taper/suppression operate on range-matched pulses below.
+        prepared = self._rows(reference,sample_rate,mode,max_age)
         if prepared is None:
             return None
-        keys, data, weights, times, aperture, coherent, samples, partial = prepared
+        keys,data,valid,times,aperture,coherent,samples,partial = prepared
+        if cancelled is not None and cancelled():
+            return None
         period = len(reference)
-        velocities = np.asarray(velocities, np.float64)
-        # The requested range can span repeated waveform periods. Calculate
-        # each physical lag once, then restore the full requested range axis.
-        delays, delay_inverse = np.unique(np.asarray(delays, int) % period, return_inverse=True)
+        geometry = np.asarray(geometry,int)
+        velocities = np.asarray(velocities,np.float64)
+        frequencies = -2*frequency*velocities/C
+        delays,inverse = np.unique(np.asarray(delays,int)%period,return_inverse=True)
         reference_fft = np.fft.fft(reference)
-        offsets = np.fft.fftfreq(period, 1/sample_rate)
-        reference_energy_fft = np.fft.fft(abs(reference)**2)
+        # These range FFTs are independent of velocity and run once per pulse.
+        correlations = np.fft.ifft(np.fft.fft(data*valid)*reference_fft.conj())[:,:,delays]
+        energy = np.maximum(np.fft.ifft(np.fft.fft(valid)*np.fft.fft(abs(reference)**2).conj()).real,0)[:,:,delays]
+        energy[energy < max(float(np.vdot(reference,reference).real)*1e-7,1e-12)] = 0
+        correlations = np.where(energy > 0,correlations,0)
+        centers = times+(period-1)/(2*sample_rate)+np.asarray([(k[1]-1)*k[2]/(2*sample_rate) for k in keys])
+        output = np.zeros((len(velocities),len(delays)),np.float64)
+        total_weight = np.zeros(len(delays),np.float64)
+        response_min,aligned = 1.,True
         groups = sorted(set(k[0] for k in keys))
-        output = np.zeros((len(velocities), len(delays)), np.float64)
-        total_group_weight = np.zeros_like(output)
-        response_min = 1.0
-        floor = 10**(response_floor_db/10)
-        group_weights = {}
         for group in groups:
-            ids = np.asarray([k[0] == group for k in keys])
-            coverage = weights[ids].sum(axis=0)
-            base = np.maximum(np.fft.ifft(np.fft.fft(coverage)*reference_energy_fft.conj()).real, 0)
-            group_weights[group] = (base, base[:, delays].sum(axis=0))
-        # Each integration's samples/coverage are invariant across velocity
-        # tiles. Previously these large masked copies were made every tile.
-        integrations_by_group = {}
-        for group in groups:
-            integrations_by_group[group] = []
-            for count, step in sorted(set((k[1], k[2]) for k in keys if k[0] == group)):
-                ids = np.asarray([k[:3] == (group, count, step) for k in keys])
-                values, coverage = data[ids], weights[ids]
-                integrations_by_group[group].append((count, step, values, coverage,
-                    (values*coverage).astype(np.complex64), times[ids], np.fft.fft(coverage.sum(axis=0))))
-        for begin in range(0, len(velocities), 16):
-            if cancelled is not None and cancelled():
-                return None
-            time.sleep(0)  # Let Python acquisition/UI callbacks run between tiles.
-            velocity = velocities[begin:begin+16]
-            fd = -2*frequency*velocity/C
-            phase = np.exp(-2j*np.pi*fd[:, None]*np.arange(period)[None]/sample_rate)
-            for group in groups:
-                numerator = np.zeros((len(fd), 8, period), np.complex128)
-                energy = np.zeros((len(fd), 8, period), np.float64)
-                moving_base = np.zeros_like(energy) if migration else None
-                for count, step, values, coverage, weighted, row_times, coverage_fft in integrations_by_group[group]:
-                    fast_frequency = offsets[None]*(1-2*velocity[:, None]/C) if migration else offsets[None]
-                    response = accumulation_response(fd[:, None]+fast_frequency, count, step/sample_rate) if count > 1 else np.ones((len(fd), period))
-                    effective_fft = reference_fft[None]*response
-                    effective = np.fft.ifft(effective_fft)
-                    if migration:
-                        folded_fft, coverage_fft = migration_terms(values, coverage, row_times, fd, velocity,
-                            sample_rate, offsets, aperture/2)
-                        numerator += np.fft.ifft(folded_fft*effective_fft[:, None].conj())
-                        energy += np.fft.ifft(coverage_fft*np.fft.fft(abs(effective)**2)[:, None].conj()).real
-                        moving_base += np.fft.ifft(coverage_fft*reference_energy_fft.conj()).real
-                    else:
-                        kernel = np.exp(-2j*np.pi*fd[:, None]*row_times[None]).astype(np.complex64)
-                        # A direct contraction avoids BLAS spawning many threads
-                        # for each small tile, which can starve the GUI process.
-                        folded = np.einsum('vr,rap->vap', kernel, weighted, optimize=False)
-                        folded *= phase[:, None, :]
-                        numerator += np.fft.ifft(np.fft.fft(folded)*effective_fft[:, None].conj())
-                        energy += np.fft.ifft(coverage_fft[None]*np.fft.fft(abs(effective)**2)[:, None].conj()).real
-                base, group_weight = group_weights[group]
-                base = np.maximum(moving_base, 0) if migration else base[None]
-                group_weight = base[:, :, delays].sum(axis=1)
-                energy = np.maximum(energy, 0)
-                relative = np.divide(energy, base, out=np.zeros_like(energy), where=base > 1e-12)
-                occupied = np.broadcast_to(base, energy.shape) > 1e-12
-                if occupied.any():
-                    response_min = min(response_min, float(relative[occupied].min()))
-                denominator = energy if compensate else np.sqrt(energy*base)
-                threshold = floor if compensate else 1e-10
-                amplitude = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=(denominator > 1e-12) & (relative >= threshold))
-                if suppress:
-                    amplitude[np.isclose(fd, 0, atol=1e-12)] = 0
-                spatial = np.zeros((len(fd), *geometry.shape, len(delays)), np.complex64)
-                for row, col in np.ndindex(geometry.shape):
-                    antenna = geometry[row, col]
-                    if antenna >= 0:
-                        spatial[:, row, col] = amplitude[:, antenna, delays]
-                power = strongest_horizontal_power(spatial, frequency, spacing_m)
-                output[begin:begin+len(fd)] += power*group_weight
-                total_group_weight[begin:begin+len(fd)] += group_weight
-        output = np.divide(output, total_group_weight, out=np.zeros_like(output), where=total_group_weight > 0)
-        return RadarResult(velocities, output[:, delay_inverse], aperture, coherent, samples, len(groups), period, response_min, partial)
+            members = np.asarray([k[0]==group for k in keys])
+            ids = np.flatnonzero(members)
+            t = centers[ids]
+            taper = np.ones(len(ids))
+            if window == 'hann' and len(ids)>1:
+                span = t.max()-t.min()+period/sample_rate
+                taper = np.sin(np.pi*(t-t.min()+period/(2*sample_rate))/span)**2
+            coverage = energy[ids]*taper[:,None,None]
+            denominator = coverage.sum(axis=0)
+            values = correlations[ids].astype(np.complex64)
+            if suppress:
+                mean = np.divide((values*taper[:,None,None]).sum(axis=0),denominator,
+                    out=np.zeros_like(denominator,dtype=np.complex128),where=denominator>1e-12)
+                values = values-mean[None]*energy[ids]
+            weighted = (values*taper[:,None,None]).astype(np.complex64)
+            numerator = np.zeros((len(velocities),8,len(delays)),np.complex128)
+            integrations = sorted(set((keys[i][1],keys[i][2]) for i in ids))
+            for count,step in integrations:
+                local = np.asarray([keys[i][1:3]==(count,step) for i in ids])
+                spectrum = slow_time_spectrum(weighted[local],t[local],frequencies,
+                    sample_rate,period,cancelled)
+                if spectrum is None:
+                    return None
+                if count>1 and step%period==0:
+                    response = accumulation_response(frequencies,count,step/sample_rate)
+                    response_min = min(response_min,float(np.min(abs(response)**2)))
+                    # Align only the boxcar sign about its centroid, without
+                    # amplifying attenuated/noisy samples or filling nulls.
+                    centered = (response*np.exp(-1j*np.pi*frequencies*(count-1)*step/sample_rate)).real
+                    spectrum *= np.where(abs(response)>1e-6,np.sign(centered),0)[:,None,None]
+                elif count>1:
+                    aligned = False  # Averaging mixes different waveform phases.
+                numerator += spectrum
+            amplitude = np.divide(numerator,denominator[None],out=np.zeros_like(numerator),where=denominator[None]>1e-12)
+            if suppress:
+                amplitude[np.isclose(frequencies,0,atol=1e-12)] = 0
+            spatial = np.zeros((len(velocities),*geometry.shape,len(delays)),np.complex64)
+            for row,col in np.ndindex(geometry.shape):
+                antenna = geometry[row,col]
+                if antenna>=0:
+                    spatial[:,row,col] = amplitude[:,antenna]
+            power = strongest_horizontal_power(spatial,frequency,spacing_m)
+            group_weight = denominator.sum(axis=0)
+            output += power*group_weight[None]
+            total_weight += group_weight
+        output = np.divide(output,total_weight[None],out=np.zeros_like(output),where=total_weight[None]>0)
+        return RadarResult(velocities,output[:,inverse],aperture,coherent,samples,len(groups),
+                           period,response_min,partial,pulses=len(keys),averaging_aligned=aligned)

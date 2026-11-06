@@ -15,6 +15,10 @@ repository_root = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(repository_root))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+# These small beam matrices are faster with one BLAS worker; leave CPU time
+# for packet ingestion. An explicit user setting still takes precedence.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import numpy as np
 import matplotlib.cm
 import matplotlib.colors
@@ -30,11 +34,13 @@ from espargos._iq_calibration.reciprocity_fit import DisconnectedLinks
 from espargos.iq_tx_control import CalibrationMeasurementError
 from demos.custom.common.iq_application import ESPARGOSIQApplication
 from demos.custom.common.iq_waterfall import WaterfallImageProvider, power_db_row
-from radar_tx import RadarTransmitter, configure_receivers, calibrate_radar_timing
+from radar_tx import RadarTransmitter, configure_receivers, calibrate_radar_timing, reset_radar_boards
 from beamforming import AZIMUTH_DEG, ELEVATION_DEG, planar_power, horizontal_power
 from clutter import RollingClutter
 from doppler import DopplerHistory
 from range_doppler import SampleRadar, minimal_replay, accumulation_layout
+from range_origin import range_origin, range_indices
+from radar_batch import RadarBatchGate
 from radar_signal import resample_replay
 from radar_signal import chirp_reference, local_geometry, matched_filter_peaks
 
@@ -234,6 +240,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler = DopplerHistory(int(self.appconfig.get("doppler_history") or 64), uniform=False)
         self._doppler_indices = {}
         self._sample_radar = SampleRadar(1024)
+        self._radar_batch_gate = RadarBatchGate()
         self._radar_capture_meta = {}
         self._doppler_info = "Waiting for IQ and a transmit reference."
         self._doppler_velocity = np.zeros(0)
@@ -529,7 +536,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _render_doppler(self):
         now = time.monotonic()
-        if not self._doppler_dirty or now-self._doppler_last_render < 0.2:
+        if not self._doppler_dirty or now-self._doppler_last_render < 1/25:
             return
         self._doppler_last_render = now
         self._doppler_dirty = False
@@ -569,6 +576,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._show_doppler_error(str(error))
             return
         max_age = max(.005, min(5., float(self._ping_config_value("doppler_observation_ms", 250))/1000))
+        if self._display_config.get("trigger", {}).get("mode") == "radar":
+            max_age = 0  # Gate already supplies exactly one complete observation.
         aperture = self._sample_radar.aperture_seconds(rate, max_age)
         desired_step = espargos.constants.SPEED_OF_LIGHT/(4*frequency*max(aperture, 1/rate))
         wanted = int(np.ceil((self.velocityMaximum-self.velocityMinimum)/desired_step))+1
@@ -582,10 +591,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return snapshot != (self.display_mode, self.velocityMinimum, self.velocityMaximum,
                                 self.delayMin, self.delayMax, self._ping_config_value("doppler_observation_ms", 250)) or not self._sample_radar.records or getattr(self, "_shutting_down", False)
         try:
-            result = self._sample_radar.maps(reference, rate, frequency, velocity, np.arange(lo, hi), geometry,
+            result = self._sample_radar.maps(reference, rate, frequency, velocity, range_indices(lo, hi, self.radarZeroSample, len(reference)), geometry,
                 mode="coherent", window="hann", spacing_m=espargos.constants.ANTENNA_SEPARATION,
                 suppress=self.remove_los and self._clutter_mode == "zero_doppler",
-                compensate=False, max_age=max_age, cancelled=cancelled)
+                max_age=max_age, cancelled=cancelled)
         except ValueError as error:
             self._show_doppler_error(str(error))
             return
@@ -598,14 +607,29 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._radar_angle_size, self._radar_delay_size = bins, hi-lo
         dv = espargos.constants.SPEED_OF_LIGHT/(2*frequency*max(result.coherent_s, 1/rate))
         step = float(velocity[1]-velocity[0])
-        self._radar_status = f"Coherent Doppler · {result.aperture_s*1000:.4g} ms acquired · Δv ≈ {dv:.4g} m/s · grid {step:.4g} m/s"
+        self._radar_status = f"Pulse Doppler · {result.pulses} matched pulses · {result.aperture_s*1000:.4g} ms acquired · Δv ≈ {dv:.4g} m/s · grid {step:.4g} m/s"
         aliases = self._sample_radar.alias_spacing(rate, frequency, max_age)
         details = (f"Capture-gap aliases ≈ {aliases:.4g} m/s apart; no guaranteed unambiguous band."
                    if aliases is not None else "No guaranteed unambiguous band from these captures.")
+        trigger = self._display_config.get("trigger", {})
+        if trigger.get("mode") == "radar":
+            count = int(trigger.get("accumulation_chunks", 8))
+            pri = int(trigger["interval_chunks"]) * CHUNK_SAMPLES / rate
+            cycle_s = int(trigger["cycle_windows"]) * pri
+            vmax = espargos.constants.SPEED_OF_LIGHT / (4 * frequency * pri)
+            range_period = len(reference) * self.radarMetersPerSample
+            bandwidth = min(rate, float(cfg.get("bandwidth_hz", rate)))
+            dr = espargos.constants.SPEED_OF_LIGHT / (2 * max(bandwidth, 1))
+            details = (f"PRI {pri*1e6:.4g} µs · {count} chunks/sum ({count*CHUNK_SAMPLES/rate*1e6:.4g} µs)"
+                       f" · slow-time band ±{vmax:.4g} m/s · cycle {cycle_s:.4g} s"
+                       f" · ΔR ≈ {dr:.4g} m · periodic range {range_period:.4g} m"
+                       f" · max averaging loss {-10*np.log10(max(result.minimum_response, 1e-12)):.2g} dB")
         if step > dv:
             details += " Narrow limits for a finer grid."
         if result.minimum_response < 1e-6:
             details += " Averaging nulls hide some velocities."
+        if not result.averaging_aligned:
+            details += " Averaging mixes waveform phases."
         self._doppler_info = details
         self.radarConfigChanged.emit()
         self.radarStatusChanged.emit()
@@ -634,7 +658,13 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         # Extract live configuration states dynamically
         s_min, s_max = EspargosPulseRadarAnalyzer._radar_delay_bounds(self, sample_count, burst_length)
 
-        sliced_traces2d = corrected[:, s_min:s_max]
+        # The upper display cutoff may be cropped; use the physical period for wrapping.
+        if self._tx_waveform is not None:
+            period = min(sample_count, len(minimal_replay(resample_replay(self._tx_waveform, config.get("fs_hz", 80e6), getattr(self, "_spectrum_sample_rate_hz", 80e6)))))
+        else:
+            period = sample_count
+        indices = range_indices(s_min, s_max, getattr(self, "radarZeroSample", float("nan")), period)
+        sliced_traces2d = corrected[:, indices]
 
         geometry = self._angle_geometry()
         row_count, column_count = geometry.shape
@@ -701,9 +731,18 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         configured_max = appconfig.get("delay_max") if appconfig is not None else min(int(sample_count), CHUNK_SAMPLES)
         delay_min = max(0, int(configured_min if configured_min is not None else 0))
         delay_max = int(configured_max if configured_max is not None else burst_length)
-        # The radar delay axis may use any part of the one-chunk payload. The
-        # periodic TX burst length is not the display-axis length.
-        upper = min(int(sample_count), CHUNK_SAMPLES)
+        # Use one actual waveform period; displaying repeated copies would
+        # relabel identical echoes as different physical ranges.
+        period = CHUNK_SAMPLES
+        waveform = getattr(self, "_tx_waveform", None)
+        if waveform is not None:
+            cfg = self._reference_ping_config()
+            try:
+                period = len(minimal_replay(resample_replay(waveform,
+                    cfg.get("fs_hz", 80e6), getattr(self, "_spectrum_sample_rate_hz", 80e6))))
+            except ValueError:
+                pass
+        upper = min(int(sample_count), CHUNK_SAMPLES, period)
         delay_min = min(delay_min, max(0, upper - 1))
         delay_max = max(delay_min + 1, min(delay_max, upper))
         return delay_min, delay_max
@@ -730,6 +769,31 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     calibration_ready = False
             corrected.append(trace)
         return np.asarray(corrected), calibration_ready
+
+    def _angle_corrected_batch(self, rows):
+        """Apply the same padded per-chunk calibration in bounded FFT batches."""
+        corrections = {}
+        if self.iqcontrol is not None:
+            for antenna in self._rx_sensor_ids():
+                try:
+                    correction = self.iqcontrol.cal_correction(self.active_board, antenna, self.fft_size)
+                except Exception:
+                    correction = None
+                if correction is not None:
+                    corrections[antenna] = np.fft.ifftshift(correction)
+        corrected = {}
+        for start in range(0, len(rows), 32):
+            block = rows[start:start+32]
+            values = np.zeros((len(block), SENSOR_COUNT, self.fft_size), np.complex64)
+            for i, (_, traces) in enumerate(block):
+                for antenna, trace in traces.items():
+                    size = min(len(trace), self.fft_size)
+                    values[i, antenna, :size] = trace[:size]
+            for antenna, correction in corrections.items():
+                values[:, antenna] = np.fft.ifft(np.fft.fft(values[:, antenna], axis=-1)*correction, axis=-1)
+            for i, (index, traces) in enumerate(block):
+                corrected[index] = {a: values[i, a, :min(len(t), self.fft_size)].copy() for a, t in traces.items()}
+        return corrected
 
     def _angle_corrected_traces(self, traces):
         return self._angle_fine_corrected_traces(traces)
@@ -1199,7 +1263,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
     @PyQt6.QtCore.pyqtSlot(float, bool, result=bool)
     def setRadarRangeMeters(self, meters, upper):
         """Snap a physical range cutoff to the nearest valid RX sample."""
-        zero = self.radarZeroSample
+        _, zero = range_origin(self.radarZeroSample)
         if not np.isfinite(meters) or not np.isfinite(zero):
             return False
         sample = int(np.floor(meters / self.radarMetersPerSample + zero + 0.5))
@@ -1211,6 +1275,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.appconfig.set({"delay_max" if upper else "delay_min": sample})
         self.radarConfigChanged.emit()
         return True
+
+    @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
+    def radarDisplayZeroSample(self):
+        return range_origin(self.radarZeroSample)[1]
 
     @PyQt6.QtCore.pyqtProperty(float, notify=radarConfigChanged)
     def radarZeroSample(self):
@@ -1300,7 +1368,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if self.render_running:
             return
         self.render_running = True
-        threading.Thread(target=self._render, daemon=True).start()
+        self._render_worker = threading.Thread(target=self._render, daemon=True)
+        self._render_worker.start()
 
     def _publish_sample_windows(self, traces):
         """Publish coherent display windows for the GUI-thread Qt Charts."""
@@ -1473,6 +1542,32 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
         selected = [(antid, *positions[antid]) for antid in self._rx_sensor_ids()]
         sets = []
+        trigger = self._display_config.get("trigger", {})
+        radar_batch = trigger.get("mode") == "radar"
+        if radar_batch:
+            if not hasattr(self, "_radar_batch_gate"):
+                self._radar_batch_gate = RadarBatchGate()
+            ready = None
+            for arrived, cluster in clusters:
+                if isinstance(cluster, IQAccumCluster):
+                    batch = self._radar_batch_gate.feed(arrived, cluster, board,
+                        [(r, c) for _, r, c in selected], trigger)
+                    if batch is not None:
+                        ready = batch
+            if ready is None:
+                if self._radar_batch_gate.message:
+                    self._radar_status = self._radar_batch_gate.message
+                    self.radarStatusChanged.emit()
+                return []
+            clusters = ready
+            # A Doppler observation must never bridge the streaming dead time.
+            self._sample_radar.clear()
+            self._radar_capture_meta.clear()
+            self._doppler_indices.clear()
+            self._doppler.clear()
+            self._doppler_rejection = None
+        elif hasattr(self, "_radar_batch_gate"):
+            self._radar_batch_gate.reset()
 
         for arrived, cluster in clusters:
             if not np.any(cluster.completion[board]):
@@ -1531,7 +1626,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     available = [positions[a] for a in per]
                     lane_counts = [cluster.counts[board, row, col, lane] for row, col in available]
                     lane_hashes = [cluster.coverage_hashes[board, row, col, lane] for row, col in available]
-                    partial = any(n != repeats for n in lane_counts) or len(set(lane_hashes)) > 1
+                    partial = (any(n != repeats for n in lane_counts) or len(set(lane_hashes)) > 1
+                               or any(int(cluster.flags[board, r, c, lane]) & 3 for r, c in available))
                     layout = None if partial or not lane_hashes else accumulation_layout(
                         cluster.source_chunk_start, cluster.source_chunk_end,
                         cluster.vector_chunks, repeats, lane, lane_hashes[0])
@@ -1626,6 +1722,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             # which visualization mode currently owns the render path.
             for _, per_antenna in sets:
                 self._collect_clutter_snapshot(per_antenna)
+        calibrated_batch = None
+        if (self.display_mode == "doppler" and trigger.get("mode") == "radar"
+                and (not self.remove_los or self._clutter_mode == "zero_doppler")):
+            calibrated_batch = self._angle_corrected_batch(sets)
         for idx, per in sets:
             self._doppler_indices.pop(idx, None)
             metadata = self._radar_capture_meta.pop(idx, None)
@@ -1649,8 +1749,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 if not metadata["partial"]:
                     source_index = metadata.pop("source_index", idx)
                     cleaned = self._cancel_line_of_sight(per) if self.remove_los and self._clutter_mode == "manual" else per
-                    corrected, _ = self._angle_corrected_traces(cleaned)
-                    if self._sample_radar.append(source_index, {a: corrected[a, :len(t)] for a, t in cleaned.items()}, **metadata):
+                    if calibrated_batch is not None:
+                        corrected_traces = calibrated_batch[idx]
+                    else:
+                        corrected, _ = self._angle_corrected_traces(cleaned)
+                        corrected_traces = {a: corrected[a, :len(t)] for a, t in cleaned.items()}
+                    if self._sample_radar.append(source_index, corrected_traces, **metadata):
                         self._doppler_rejection = None
                         self._doppler_dirty = True
                 else:
@@ -1912,12 +2016,14 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         print("Startup timed out; aborting before the process can hang indefinitely.", file=sys.stderr)
         self.render_running = False
-        self._stop_ping_tx()
         if hasattr(self, "engine") and not self.engine.rootObjects():
             print("QML UI did not load; aborting execution.", file=sys.stderr)
         self.quit()
 
     def onAboutToQuit(self):
+        if getattr(self, "_shutdown_started", False):
+            return
+        self._shutdown_started = True
         self._shutting_down = True
         self._live_tx_timer.stop()
         self.txcontrol.timer.stop()
@@ -1926,8 +2032,33 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.render_running = False
         if self._tx_worker is not None:
             self._tx_worker.join()
+        # Calibration restores saved waveforms and roles in its finally blocks.
+        # It must finish before the last hardware cleanup, not in the base
+        # shutdown after replay buffers have already been reset.
+        controller = getattr(self, "iqcontrol", None)
+        worker = getattr(controller, "_reference_thread", None)
+        if worker is not None:
+            worker.join()
+        if controller is not None:
+            # Drain a reference-tone write already in flight and discard queued
+            # edits. A late tone worker must not re-enable REF after cleanup.
+            with controller._reference_io_lock:
+                controller._reference_busy = True
+                with controller._tone_state_lock:
+                    controller._tone_pending = None
+        worker = getattr(self, "_render_worker", None)
+        if worker is not None:
+            worker.join()
         try:
-            self._stop_ping_tx()
+            try:
+                self._stop_ping_tx()
+            except Exception:
+                self.logger.exception("Could not confirm radar TX mute; continuing board cleanup")
+            if hasattr(self, "pool"):
+                try:
+                    reset_radar_boards(self.pool)
+                except Exception:
+                    self.logger.exception("Radar board cleanup incomplete; next startup may require recovery")
         finally:
             super().onAboutToQuit()  # ESPARGOSIQApplication restores WiFi mode
 
@@ -1963,7 +2094,8 @@ if __name__ == "__main__":
         sys.exit(app.exec())
     except KeyboardInterrupt:
         print("Interrupted by user; shutting down cleanly.", file=sys.stderr)
-        app.render_running = False
-        app._stop_ping_tx()
-        app.quit()
         sys.exit(130)
+    finally:
+        # Qt emits aboutToQuit only when its event loop has started. Also
+        # clean up failed startup paths that return before entering that loop.
+        app.onAboutToQuit()

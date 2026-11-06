@@ -154,14 +154,14 @@ class TransmissionUITest(unittest.TestCase):
             pump()
             self.assertTrue(start.property("enabled"))
             self.assertTrue(end.property("enabled"))
-            start.setProperty("text", str((20.4 - app.radarZeroSample) * app.radarMetersPerSample))
+            start.setProperty("text", str((20.4 - app.radarDisplayZeroSample) * app.radarMetersPerSample))
             QMetaObject.invokeMethod(start, "editingFinished")
-            end.setProperty("text", str((90.3 - app.radarZeroSample) * app.radarMetersPerSample))
+            end.setProperty("text", str((90.3 - app.radarDisplayZeroSample) * app.radarMetersPerSample))
             QMetaObject.invokeMethod(end, "editingFinished")
             pump()
             self.assertEqual((app.delayMin, app.delayMax), (20, 90))
-            self.assertAlmostEqual(float(start.property("text")), (20 - app.radarZeroSample) * app.radarMetersPerSample, places=3)
-            self.assertAlmostEqual(float(end.property("text")), (90 - app.radarZeroSample) * app.radarMetersPerSample, places=3)
+            self.assertAlmostEqual(float(start.property("text")), (20 - app.radarDisplayZeroSample) * app.radarMetersPerSample, places=3)
+            self.assertAlmostEqual(float(end.property("text")), (90 - app.radarDisplayZeroSample) * app.radarMetersPerSample, places=3)
             app._radar_timing = None
             app._tx_calibration_valid = False
             app.radarConfigChanged.emit()

@@ -152,8 +152,13 @@ class IQAccumPacket:
     WIRE_BYTES = HEADER_BYTES + PAYLOAD_BYTES + 4
 
     def __init__(self, pktbuf):
-        if len(pktbuf) < self.WIRE_BYTES:
+        if len(pktbuf) < self.HEADER_BYTES + 4:
             raise ValueError("IQ accumulation packet too short")
+        packed16 = bool(int.from_bytes(pktbuf[64:68], "little") & 0x100)
+        self.PAYLOAD_BYTES = (4 if packed16 else 8) * IQ_CHUNK_SAMPLE_WORDS
+        self.WIRE_BYTES = self.HEADER_BYTES + self.PAYLOAD_BYTES + 4
+        if len(pktbuf) != self.WIRE_BYTES:
+            raise ValueError("IQ accumulation packet length mismatch")
         self.type_header = int.from_bytes(pktbuf[0:4], byteorder="little")
         if self.type_header != IQ_ACCUM_TYPE_HEADER:
             raise ValueError("Unexpected IQ accumulation type header")
@@ -197,7 +202,7 @@ class IQAccumPacket:
         sums = (
             np.frombuffer(
                 pktbuf[self.HEADER_BYTES : self.HEADER_BYTES + self.PAYLOAD_BYTES],
-                dtype="<i4",
+                dtype="<i2" if packed16 else "<i4",
             )
             .reshape(IQ_CHUNK_SAMPLE_WORDS, 2)
             .copy()
