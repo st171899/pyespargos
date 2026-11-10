@@ -1,0 +1,17 @@
+# Separate board, assumed normal horizontal orientation. Cable values are placeholders.
+combined-array:
+  boards:
+    master:
+      host: 10.42.0.35
+      cable:
+        length: 0.0
+        velocity_factor: 0.76
+  array:
+  - - master.0.0
+    - master.0.1
+    - master.0.2
+    - master.0.3
+  - - master.1.0
+    - master.1.1
+    - master.1.2
+    - master.1.3
