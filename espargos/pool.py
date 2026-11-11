@@ -521,7 +521,8 @@ class Pool(AntennaSelection):
         with self._lock:
             self.open()
             if self._iq is None:
-                self._iq = IQReceiver(self)
+                self._iq = IQReceiver(self, master_index=(self.names.index(self._geometry.reference_master)
+                    if self._geometry.reference_master is not None else None))
                 self._refresh_receivers()
             return self._iq
 

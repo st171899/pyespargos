@@ -54,6 +54,10 @@ class IQAccumCluster(SensorCluster):
         self._flags = np.zeros(section_shape, dtype=np.uint32)
         self._deadline_aborts = np.zeros(section_shape, dtype=np.uint32)
         self._fire_time_ns = np.zeros(self.shape, dtype=np.uint64)
+        self._sync_info = np.zeros(self.shape, dtype=np.uint32)
+        self.rx_gain = np.zeros(section_shape, dtype=np.uint32)
+        self.gain_mode = np.zeros(section_shape, dtype=np.uint32)
+        self.dropped_windows = np.zeros(section_shape, dtype=np.uint32)
         self._section_completion = np.zeros(section_shape, dtype=np.bool_)
 
     def add_message(self, board_index, sensor_message):
@@ -122,6 +126,10 @@ class IQAccumCluster(SensorCluster):
         self._flags[slot] = int(payload.flags)
         self._deadline_aborts[slot] = int(payload.deadline_aborts)
         self._fire_time_ns[position] = int(payload.fire_time_ns)
+        self._sync_info[position] = int(getattr(payload, "sync_info", 0))
+        self.rx_gain[slot] = int(getattr(payload, "rx_gain", 0))
+        self.gain_mode[slot] = int(getattr(payload, "gain_mode", 0))
+        self.dropped_windows[slot] = int(getattr(payload, "dropped_windows", 0))
         self._section_completion[slot] = True
         if np.all(self._section_completion[position]):
             self._mark_sensor_position_complete(position)
@@ -165,6 +173,11 @@ class IQAccumCluster(SensorCluster):
         """Cumulative sensor-side source-stage misses at this section."""
 
         return self._deadline_aborts
+
+    @property
+    def sync_info(self):
+        """Per-sensor grid synchronization identity, preserved from the wire."""
+        return self._sync_info
 
     @property
     def fire_time_ns(self) -> np.ndarray:

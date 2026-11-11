@@ -134,20 +134,17 @@ not separately resolve elevation at each range bin. Calibration, sufficient
 aperture, and an isolated far-field return are needed for a meaningful bearing;
 TX steering cannot remove multipath or establish a known-angle reference.
 
-The **Receive board** tabs remain available in Angle and Radar modes as well
-as the antenna views. Every receive view uses only the selected board's IQ,
-calibration, and physical 2×4 antenna positions; mixed-role TX sensors are
-excluded. Switching boards clears the previous bearing and map while waiting
-for fresh IQ. A board-list or YAML display layout does not establish the
-relative physical positions of separate boards.
+In the ESPARGOS-transmitter variant, Angle, Radar and range–Doppler use all
+active receiving antennas in the configured aperture. Board tabs are hidden in
+those modes. Power, phase, time, Ping and constellation views retain individual
+board tabs labelled with their applied TX/RX roles. With radar accumulation,
+these ordinary views display each acquired 256-sample profile independently;
+spectral zero-padding does not turn the gaps between profiles into measurements.
+The original Pluto-transmitter variant retains its board-local receive views.
 
-For a future measured regular multi-board grid, see the `MULTI-BOARD GRID`
-comments in `_angle_geometry()` and `_drain_sets()` in both Python demos.
-Retain unique `(board, antenna)` identities, collect synchronized data from all
-boards, apply each board's calibration, and supply measured offsets and
-orientations to the steering calculation. A joint aperture also needs coherent
-timing/phase calibration between boards. Enlarging the local geometry alone
-would reuse local antenna IDs and give incorrect angles.
+A grouped aperture requires the physical board order/orientation and coherent
+inter-board calibration. See the four-board configuration below. The library
+keeps board and antenna identities distinct throughout collection and correction.
 
 ## ESPARGOS transmitter and receiver demo
 
@@ -190,8 +187,9 @@ that rate when new complete display data is available. Angle estimates are
 computed on those worker updates; the angle curve refreshes at **10 Hz
 (100 ms)**. Range–azimuth maps have a **100 ms minimum processing interval**
 (typically 120 ms between updates on the 40 ms worker clock). Range–Doppler
-maps rest at least **200 ms after each completed search**, and process only
-new data or changed settings. Their actual rate depends on history, reference
+maps process only new data or changed settings. The ESPARGOS variant computes
+maps in one separate process, with one observation in flight and a 40 ms
+minimum rest after each search. Their actual rate depends on history, reference
 length and grid size. Hidden chart timers stop.
 The receive queue also settles clusters for 200 ms; non-Doppler displays wait
 another 200 ms while assembling blocks, so refresh rate is distinct from latency.
@@ -200,8 +198,52 @@ another 200 ms while assembling blocks, so refresh rate is distinct from latency
 operation, mutes TX, and restores WiFi mode. Leave at least one sensor receiving.
 TX channels have empty receive displays and do not count toward receive
 completeness, clutter calibration, or angle processing. Angle estimation needs
-at least four receive antennas in the selected board. Receive views process one
-selected board at a time; they do not combine apertures across board tabs.
+at least four receive antennas. The ESPARGOS variant automatically uses all
+active RX antennas in the configured physical aperture for angle, range–azimuth
+and range–Doppler views; those views have no board-selection tabs. The other
+views retain individual-board selection, with applied TX/RX roles in the tabs.
+
+For the separate myspargel plus three-board 6×4 aperture, launch:
+
+```sh
+python demos/custom/pulse-radar-analyzer/pulse-radar-analyzer-espargi.py \
+  --config config/radar-four-boards.yml
+```
+
+The architecture file lists all boards, the separate physical aperture groups,
+reference master and cable parameters. It does not choose TX/RX roles. Selecting
+a TX group in the application selects all its antennas and leaves other groups
+receiving; individual sensor settings remain available. Geometric TX steering
+cannot span independent apertures with unknown relative positions. Likewise,
+spatial RX processing reports a configuration error when receivers span those
+independent apertures. Existing `combined-array.array` configurations remain
+supported for the two-board workflow.
+
+Calibration checks the boards' live `calib-source` settings: one master and
+three slaves must agree with the configured reference master. It measures RX
+and TX phase/timing, then the common range origin through the reference network.
+Timing-probe gain is lowered on clipping or increased for weak captures, with
+bounded retries and unchanged quality checks. Firmware radar observations are
+accepted with at least **75% of antenna profiles from each receive board**
+over either a single-board or multi-board observation, at least **90% of pulse timestamps**, and
+at least **95% of the requested time span**. Each retained pulse needs at least
+half the selected aperture. For 216 pulses and three eight-antenna boards,
+that means at least 3,888 valid profiles of 5,184, including at least 1,296
+from each board, and at least 195 distinct pulse timestamps. All 24 antennas
+are used when available; this threshold does not deliberately discard them.
+The same thresholds apply to a single RX board (all eight antennas remain selected). Invalid
+accumulation counts, coverage fingerprints and mixed synchronization epochs
+remain rejected. Missing antenna/pulse data stay masked at their physical
+positions and source timestamps, never interpolated or relabelled. Loss reduces
+sensitivity and can raise sidelobes; the status reports actual coverage and the
+velocity spacing calculated from the retained time span. Instantaneous angle
+and range-azimuth views require six antennas per board in their selected
+snapshot. Incomplete radar clusters wait at most 1.5 s for late packets;
+complete clusters proceed immediately. This increases loss-recovery latency,
+not the steady capture interval. Ordinary trigger modes retain their original
+settling behavior. Board-local generation counters need not be identical. Physical order is second, third, fourth; all reference cables are
+2 m with velocity factor 0.76. A simulator adds its own processing latency;
+reference-network range calibration does not remove that external delay.
 
 The receive view stays visible while the nonmodal sidebar is open. Running TX
 updates automatically after beam, waveform, chirp, gain, or RF edits; rapid
@@ -553,3 +595,51 @@ positions against the packet's coverage fingerprint before assigning the
 first sample timestamp and averaging step. It models averaging with that
 verified step, preserving its real attenuation/null velocities.
 
+
+For a full 24-antenna, 256-sample radar observation near one update/s at
+2.4 GHz, start with 216 pulses, four chunks per sum, and 2,850 cycle windows.
+Use interval 24 at 20 MSa/s / 20 MHz bandwidth, or interval 48 at 40 MSa/s /
+40 MHz bandwidth. Both give PRI 307.2 microseconds, cycle 0.87552 s,
+nominal velocity band +/-101.65 m/s and approximately 0.95 m/s Fourier
+spacing. Hann-windowed target separation is wider than that spacing. The
+Doppler display uses a grid no coarser than the observation's Fourier spacing;
+additional interpolation would not improve physical resolution. Range span
+remains about 1,919 m at 20 MSa/s and 959 m at 40 MSa/s. Hardware validation
+results and injected packet-loss tests are recorded in the ignored
+`demos/radar-array-tests/optimization` folder.
+
+### Angle and screen convention
+
+The radar heatmap retains its original boards’ outward-looking view. Right is
+positive azimuth, left is negative, zero is broadside, and elevation is positive
+upwards. TX circles, drag controls, numerical steering and the AoA curve use the
+same convention. The underlying library direction cosine `u` and calibration
+phases retain their original convention: `u = -sin(display_azimuth) * cos(elevation)`.
+The conversion happens at the custom analyzer's input/output boundaries; it
+must not be applied a second time to library steering or calibration.
+
+The heatmap reports projected horizontal angle `-asin(u)`, while AoA reports
+azimuth at the estimated elevation. Their numbers agree at zero elevation;
+at nonzero elevation the projection differs. TX/RX bearings can also differ
+for separated apertures. The configured antenna geometry must match mounting.
+
+### Radar reception and batch latency
+
+The custom ESPARGOS analyzer uses a bounded UDP reader/reassembly process per
+board. This keeps kernel sockets draining while Python assembles observations
+or renders. Payloads, integer sums, timestamps, indices, gains and status messages
+retain their original protocol and decoding. Other demos and shared framework
+files are unchanged. Reader overload is reported as a stream error.
+
+Radar callbacks wait for the selected aperture to complete or settle; ordinary
+modes retain their original behavior. There is no additional 200 ms display wait
+for radar clusters. Expiry housekeeping runs at most every 20 ms in radar mode;
+calibration and other triggers retain the original cadence. Complete observations
+still arrive immediately. Doppler computation remains in its existing worker.
+The radar heatmap's coordinate conversion already runs in the fragment shader.
+
+A retained partial observation must cover 90% of pulse timestamps, 95% of the
+requested time span and 75% of antenna profiles per board. Missing measurements
+are masked, not filled or assigned replacement timestamps. When processing falls
+behind, the display selects the newest usable batch rather than accumulating an
+unbounded queue of stale pictures.

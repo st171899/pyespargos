@@ -40,7 +40,9 @@ from clutter import RollingClutter
 from doppler import DopplerHistory
 from range_doppler import SampleRadar, minimal_replay, accumulation_layout
 from range_origin import range_origin, range_indices
-from radar_batch import RadarBatchGate
+from radar_batch import RadarBatchGate, show_batch_message
+from radar_receiver import configure_radar_maintenance
+from radar_transport import install_radar_transport
 from radar_signal import resample_replay
 from radar_signal import chirp_reference, local_geometry, matched_filter_peaks
 
@@ -194,6 +196,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.iqcontrol = None  # IQController QML adapter, created once the pool is up
         self.txcontrol = RadarTxController(self)
         self.active_board = 0
+        self._channel_capacity = max(8, 8*len(self.initial_config.get("combined-array", {}).get("boards", {})))
         # clusters delivered by the pool's processing worker, drained by the
         # render thread (bounded so a stalled render cannot grow it unboundedly)
         self._pending_lock = threading.Lock()
@@ -212,15 +215,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.block_acc = {}  # block_id -> {antid: {slot: iq}}
         self.last_display_block = -1
         self.block_time = {}  # block_id -> last-update monotonic time (stale eviction)
-        self.rows_rendered = [0] * SENSOR_COUNT
+        self.rows_rendered = [0] * self._channel_capacity
         self.render_running = False
         self._first_sets_logged = False
         self._sample_window_lock = threading.Lock()
-        self._sample_windows = [np.zeros(self.fft_size, dtype=np.complex64) for _ in range(SENSOR_COUNT)]
-        self._sample_window_present = [False] * SENSOR_COUNT
+        self._sample_windows = [np.zeros(self.fft_size, dtype=np.complex64) for _ in range(self._channel_capacity)]
+        self._sample_window_present = [False] * self._channel_capacity
         self._sample_window_generation = 0
-        self._time_trace_consumed = [-1] * SENSOR_COUNT
-        self._constellation_consumed = [-1] * SENSOR_COUNT
+        self._time_trace_consumed = [-1] * self._channel_capacity
+        self._constellation_consumed = [-1] * self._channel_capacity
         self._spectrum_sample_rate_hz = DECIM_TO_FS[1]
         self._spectrum_center_hz = 2400e6
         self._startup_abort_seconds = 20.0
@@ -239,8 +242,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._radar_last_render_time = 0.0
         self._doppler = DopplerHistory(int(self.appconfig.get("doppler_history") or 64), uniform=False)
         self._doppler_indices = {}
-        self._sample_radar = SampleRadar(1024)
-        self._radar_batch_gate = RadarBatchGate()
+        self._sample_radar = SampleRadar(1024, offload=True)
+        self._radar_batch_gate = RadarBatchGate(allow_partial_array=True, allow_partial_single=True)
         self._radar_capture_meta = {}
         self._doppler_info = "Waiting for IQ and a transmit reference."
         self._doppler_velocity = np.zeros(0)
@@ -255,7 +258,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._clutter_calibrated = False
         self._clutter_collected_blocks = 0
         self._clutter_target_blocks = 200
-        self._clutter_buffer = {antid: [] for antid in range(SENSOR_COUNT)}
+        self._clutter_buffer = {antid: [] for antid in range(self._channel_capacity)}
         self._clutter_reference = {}
         self._clutter_status_text = "Clutter removal: Inactive"
 
@@ -264,21 +267,97 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._radar_frame = self._doppler_frame = 0
         self.engine.addImageProvider("radarmap", self._radar_image)
         self.engine.addImageProvider("dopplermap", self._doppler_image)
-        self.providers = [WaterfallImageProvider(CHUNK_SAMPLES, WATERFALL_HEIGHT) for _ in range(SENSOR_COUNT)]
-        for antid in range(SENSOR_COUNT):
+        self.providers = [WaterfallImageProvider(CHUNK_SAMPLES, WATERFALL_HEIGHT) for _ in range(self._channel_capacity)]
+        for antid in range(self._channel_capacity):
             self.engine.addImageProvider(f"display{antid}", self.providers[antid])
 
         self.appConfigChanged.connect(self._on_app_config_changed)
         self.remove_los = bool(self.appconfig.get("remove_los"))
+
+    def _prepare_pool_init(self, additional_calibrate_args):
+        additional_calibrate_args = super()._prepare_pool_init(additional_calibrate_args)
+        install_radar_transport(self.pool)
+        return additional_calibrate_args
 
     def _create_receiver(self, owner):
         self.radar_tx = RadarTransmitter(owner, self.args)
         self.radar_tx.configure()
         return owner.iq
 
+    def _array_groups(self):
+        return getattr(getattr(getattr(self, "pool", None), "_geometry", None), "groups", {})
+
+    def _receive_boards(self):
+        pool, tx = getattr(self, "pool", None), getattr(self, "radar_tx", None)
+        if pool is not None and tx is not None and getattr(self, "display_mode", "") in ("angle", "radar", "doppler"):
+            return tuple(b for b in range(len(pool.boards)) if tx.receivers(b))
+        return (getattr(self, "active_board", 0),)
+
+    def _channel_identity(self, channel):
+        boards = EspargosPulseRadarAnalyzer._receive_boards(self)
+        return boards[channel // 8], channel % 8
+
+    def _processing_channels(self):
+        return 8 * len(EspargosPulseRadarAnalyzer._receive_boards(self))
+
     def _rx_sensor_ids(self):
         tx = getattr(self, "radar_tx", None)
-        return tx.receivers(self.active_board) if tx else tuple(range(SENSOR_COUNT))
+        return tuple(i*8+a for i, b in enumerate(EspargosPulseRadarAnalyzer._receive_boards(self))
+                     for a in (tx.receivers(b) if tx else range(8)))
+
+    @PyQt6.QtCore.pyqtProperty("QVariantList", notify=boardSelectionChanged)
+    def apertureGroups(self):
+        return [{"name": name, "boards": [self.pool.names[b] for b in g["boards"]],
+                 "antennas": len(g["boards"])*8} for name, g in EspargosPulseRadarAnalyzer._array_groups(self).items()]
+
+    @PyQt6.QtCore.pyqtProperty("QVariantList", notify=txStateChanged)
+    def boardRoleLabels(self):
+        if not hasattr(self, "pool"):
+            return []
+        tx = getattr(self, "radar_tx", None)
+        labels = []
+        for b, name in enumerate(self.pool.names):
+            rx = len(tx.receivers(b)) if tx else 8
+            role = "RX" if rx == 8 else "TX" if rx == 0 else f"TX {8-rx} / RX {rx}"
+            labels.append(f"{name} · {role} · {self.pool.hosts[b]}")
+        return labels
+
+    @PyQt6.QtCore.pyqtSlot(str, bool)
+    def setTxGroup(self, name, selected):
+        if self.txBusy or name not in EspargosPulseRadarAnalyzer._array_groups(self):
+            return
+        tokens = set(self._tx_settings["tx_sensors"])
+        members = {f"{self.pool.names[b]}.{a}" for b in EspargosPulseRadarAnalyzer._array_groups(self)[name]["boards"] for a in range(8)}
+        tokens = members if selected else tokens - members
+        self._tx_settings["tx_sensors"] = sorted(tokens)
+        self._check_tx_settings_calibration()
+        self.txStateChanged.emit()
+
+    def _ensure_receive_board(self):
+        tx = getattr(self, "radar_tx", None)
+        if tx is not None and hasattr(self, "pool") and not tx.receivers(self.active_board):
+            for board in range(len(self.pool.boards)):
+                if tx.receivers(board):
+                    self.set_active_board(board)
+                    break
+
+    def _clear_receive_selection(self):
+        self._radar_last_valid_frame = None
+        self._doppler.clear()
+        self._sample_radar.clear()
+        self._radar_capture_meta.clear()
+        self._doppler_indices.clear()
+        self._doppler_dirty = True
+        self._display_epoch = None
+        self._display_epoch_time = -1.0
+        self.block_acc.clear()
+        self.block_time.clear()
+        self.last_display_block = -1
+        if hasattr(self, "_radar_batch_gate"):
+            self._radar_batch_gate.reset()
+        with self._pending_lock:
+            self._pending_clusters.clear()
+        self._reset_clutter()
 
     def _reference_ping_config(self):
         return self._active_ping_config or self._current_ping_config()
@@ -334,6 +413,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self._doppler_dirty = True
             self._doppler_velocity = np.zeros(0)
             self.display_mode = mode
+            self._clear_receive_selection()
             self.block_acc.clear()
             self.block_time.clear()
             self.last_display_block = -1
@@ -401,17 +481,35 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.clutterStatusChanged.emit()
 
     def _angle_geometry(self):
-        """Physical aperture of the selected receive board only."""
-        # MULTI-BOARD GRID: replace this board-local map with measured antenna
-        # positions (including board offsets/orientations) when arrays are
-        # mounted on a known regular grid. Also change _drain_sets to retain
-        # (board, antenna) identities and _angle_fine_corrected_traces to apply
-        # each board's calibration. Angle and heatmap processing both consume
-        # this geometry; concatenating local IDs would alias distinct sensors.
-        # The YAML indexing matrix alone is not a measured board placement.
-        if not hasattr(self, "pool") or not 0 <= self.active_board < len(self.pool.boards):
+        """Physical grid mapped to unique channels in the selected aperture."""
+        boards = EspargosPulseRadarAnalyzer._receive_boards(self)
+        groups = EspargosPulseRadarAnalyzer._array_groups(self)
+        group = next((g for g in groups.values() if set(boards) <= set(g["boards"])), None) if boards else None
+        if groups and group is None:
+            raise ValueError("RX antennas span separate apertures. Apply TX roles leaving one physical RX aperture.")
+        # Legacy combined-array files describe one aperture directly.
+        if not groups and len(boards) > 1:
+            indices = getattr(getattr(self, "pool", None), "indexing_matrix", None)
+            if indices is not None:
+                group = {"indices": indices}
+        if group:
+            grid = np.full(group["indices"].shape, -1, dtype=int)
+            selected = set(self._rx_sensor_ids())
+            for cell in np.ndindex(grid.shape):
+                b, local = divmod(int(group["indices"][cell]), 8)
+                if b not in boards:
+                    continue
+                for a in range(8):
+                    if self.pool.boards[b].revision.antenna_id_to_row_col(a) == divmod(local, 4):
+                        channel = boards.index(b)*8+a
+                        if channel in selected:
+                            grid[cell] = channel
+            return grid
+        if not hasattr(self, "pool") or not boards or not 0 <= boards[0] < len(self.pool.boards):
             return np.full((2, 4), -1, dtype=int)
-        return local_geometry(self.pool.boards[self.active_board].revision, self._rx_sensor_ids())
+        if len(boards) > 1:
+            raise ValueError("Joint RX requires a configured aperture group")
+        return local_geometry(self.pool.boards[boards[0]].revision, self._rx_sensor_ids())
 
     def _collect_clutter_snapshot(self, raw_traces):
         """Collect complete raw-IQ periods for a static-environment baseline."""
@@ -579,7 +677,9 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if self._display_config.get("trigger", {}).get("mode") == "radar":
             max_age = 0  # Gate already supplies exactly one complete observation.
         aperture = self._sample_radar.aperture_seconds(rate, max_age)
-        desired_step = espargos.constants.SPEED_OF_LIGHT/(4*frequency*max(aperture, 1/rate))
+        # One grid step no wider than the physical Fourier spacing is
+        # sufficient; extra interpolation cannot improve velocity resolution.
+        desired_step = espargos.constants.SPEED_OF_LIGHT/(2*frequency*max(aperture, 1/rate))
         wanted = int(np.ceil((self.velocityMaximum-self.velocityMinimum)/desired_step))+1
         bins = min(513, max(129, (1 << max(0, wanted-2).bit_length())+1))
         velocity = np.linspace(self.velocityMinimum, self.velocityMaximum, bins)
@@ -607,7 +707,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._radar_angle_size, self._radar_delay_size = bins, hi-lo
         dv = espargos.constants.SPEED_OF_LIGHT/(2*frequency*max(result.coherent_s, 1/rate))
         step = float(velocity[1]-velocity[0])
-        self._radar_status = f"Pulse Doppler · {result.pulses} matched pulses · {result.aperture_s*1000:.4g} ms acquired · Δv ≈ {dv:.4g} m/s · grid {step:.4g} m/s"
+        coverage = sum(np.count_nonzero(record[1]) for record in self._sample_radar.records.values()) / max(1, int(self._display_config.get("trigger", {}).get("pulses", len(self._sample_radar.records)))*len(self._rx_sensor_ids())*CHUNK_SAMPLES)
+        self._radar_status = f"Pulse Doppler · {len(self._rx_sensor_ids())} RX antennas · {coverage:.0%} coverage · {result.pulses} matched pulses · {result.aperture_s*1000:.4g} ms acquired · Δv ≈ {dv:.4g} m/s · grid {step:.4g} m/s"
         aliases = self._sample_radar.alias_spacing(rate, frequency, max_age)
         details = (f"Capture-gap aliases ≈ {aliases:.4g} m/s apart; no guaranteed unambiguous band."
                    if aliases is not None else "No guaranteed unambiguous band from these captures.")
@@ -633,6 +734,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler_info = details
         self.radarConfigChanged.emit()
         self.radarStatusChanged.emit()
+        self._radar_last_valid_frame = time.monotonic()
         publish_map(self, pixels, True)
 
     def _render_radar_heatmap(self, traces):
@@ -643,7 +745,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
         corrected, calibration_ready = self._angle_corrected_traces(traces)
 
-        if corrected is None or corrected.shape[0] < SENSOR_COUNT:
+        if corrected is None or corrected.shape[0] < EspargosPulseRadarAnalyzer._processing_channels(self):
             self._radar_status = "❌ Processing Error: Calibrated array matrix size invalid."
             self.radarStatusChanged.emit()
             return
@@ -713,10 +815,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         else:
             processing = "Matched-filtered" if self._tx_waveform is not None else "Raw IQ (TX inactive)"
             calibration = "calibrated" if calibration_ready else "uncalibrated"
-            self._radar_status = f"{processing} · {calibration} · {len(traces)}/{SENSOR_COUNT} antennas"
+            self._radar_status = f"{processing} · {calibration} · {len(traces)}/{EspargosPulseRadarAnalyzer._processing_channels(self)} antennas"
         self.radarStatusChanged.emit()
 
         # QML reads the current angleSize and delaySize before uploading RGBA.
+        if traces:
+            self._radar_last_valid_frame = time.monotonic()
         publish_map(self, np_data)
 
     def _radar_delay_bounds(self, sample_count=None, burst_length=None):
@@ -751,7 +855,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         """Apply the existing relative-phase calibration to all antenna traces."""
         corrected = []
         calibration_ready = self.iqcontrol is not None
-        for antid in range(SENSOR_COUNT):
+        for antid in range(EspargosPulseRadarAnalyzer._processing_channels(self)):
             source = np.asarray(traces.get(antid, np.zeros(0, dtype=np.complex64)), dtype=np.complex64).reshape(-1)
             trace = np.zeros(max(0, self.fft_size), dtype=np.complex64)
             copy_count = min(trace.size, source.size)
@@ -759,7 +863,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 trace[:copy_count] = source[:copy_count]
             if self.iqcontrol is not None and antid in self._rx_sensor_ids():
                 try:
-                    correction = self.iqcontrol.cal_correction(self.active_board, antid, self.fft_size)
+                    correction = self.iqcontrol.cal_correction(*EspargosPulseRadarAnalyzer._channel_identity(self, antid), self.fft_size)
                 except Exception:
                     correction = None
                 if correction is not None:
@@ -776,7 +880,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if self.iqcontrol is not None:
             for antenna in self._rx_sensor_ids():
                 try:
-                    correction = self.iqcontrol.cal_correction(self.active_board, antenna, self.fft_size)
+                    correction = self.iqcontrol.cal_correction(*EspargosPulseRadarAnalyzer._channel_identity(self, antenna), self.fft_size)
                 except Exception:
                     correction = None
                 if correction is not None:
@@ -784,19 +888,30 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         corrected = {}
         for start in range(0, len(rows), 32):
             block = rows[start:start+32]
-            values = np.zeros((len(block), SENSOR_COUNT, self.fft_size), np.complex64)
+            values = np.zeros((len(block), EspargosPulseRadarAnalyzer._processing_channels(self), self.fft_size), np.complex64)
             for i, (_, traces) in enumerate(block):
                 for antenna, trace in traces.items():
                     size = min(len(trace), self.fft_size)
                     values[i, antenna, :size] = trace[:size]
-            for antenna, correction in corrections.items():
-                values[:, antenna] = np.fft.ifft(np.fft.fft(values[:, antenna], axis=-1)*correction, axis=-1)
+            if corrections:
+                from scipy import fft
+                antennas = list(corrections)
+                factors = np.asarray([corrections[a] for a in antennas], np.complex64)
+                values[:, antennas] = fft.ifft(fft.fft(values[:, antennas], axis=-1)*factors, axis=-1)
             for i, (index, traces) in enumerate(block):
                 corrected[index] = {a: values[i, a, :min(len(t), self.fft_size)].copy() for a, t in traces.items()}
         return corrected
 
     def _angle_corrected_traces(self, traces):
         return self._angle_fine_corrected_traces(traces)
+
+    def _spatial_coverage_ready(self, traces):
+        boards = EspargosPulseRadarAnalyzer._receive_boards(self)
+        selected = self._rx_sensor_ids()
+        if len(boards) == 1:
+            return bool(selected) and set(selected).issubset(traces)
+        return all(sum(a in traces for a in selected if a//8 == i) >= min(6, sum(a//8 == i for a in selected))
+                   for i in range(len(boards)))
 
     def _update_angle_estimate(self, traces):
         # Use raw received IQ when TX is off; otherwise use the matched-filter
@@ -809,7 +924,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._angle_status = "Run IQ calibration before estimating angle."
             self.angleChanged.emit()
             return
-        if not set(self._rx_sensor_ids()).issubset(traces):
+        if not EspargosPulseRadarAnalyzer._spatial_coverage_ready(self, traces):
             return
 
         geometry = self._angle_geometry()
@@ -843,7 +958,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
 
         peak_row, peak_column = np.unravel_index(int(np.argmax(power_2d)), power_2d.shape)
-        self._angle_estimate_deg = float(AZIMUTH_DEG[peak_column])
+        # Public angles are positive screen-right; the library scan is +left.
+        self._angle_estimate_deg = -float(AZIMUTH_DEG[peak_column])
         self._elevation_estimate_deg = float(ELEVATION_DEG[peak_row])
 
         # A physical azimuth cut at the estimated elevation. All chart values
@@ -851,7 +967,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         spectrum = power_2d[peak_row]
         self._angle_spectrum = (spectrum / np.max(spectrum)).astype(np.float32)
         processing = "Matched-filtered IQ" if self._tx_waveform is not None else "Received IQ (TX inactive)"
-        self._angle_status = f"{processing}: conventional beamforming; azimuth cut at {self._elevation_estimate_deg:.1f}° elevation."
+        self._angle_status = f"{processing}: {len(traces)}/{len(self._rx_sensor_ids())} RX antennas; conventional beamforming; azimuth cut at {self._elevation_estimate_deg:.1f}° elevation."
         self.angleChanged.emit()
 
     def _set_fft_size(self, n):
@@ -985,7 +1101,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 self._tx_settings["calibration_path"] = "reference"
             if key in ("tx_azimuth", "tx_elevation"):
                 az, el = np.radians([self._tx_settings["tx_azimuth"], self._tx_settings["tx_elevation"]])
-                self.steerTx(float(np.sin(az)*np.cos(el)), float(np.sin(el)))
+                self.steerTx(float(-np.sin(az)*np.cos(el)), float(np.sin(el)))
             if key == "tx_squint":
                 self.txcontrol.data["beams"][0]["squint"] = bool(value)
                 self._tx_settings["beams"] = copy.deepcopy(self.txcontrol.data["beams"][:self.txcontrol.data["count"]])
@@ -998,11 +1114,11 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             return
         norm = max(1.0, np.hypot(u, v))
         u, v = u / norm, v / norm
-        self._tx_settings["tx_azimuth"] = float(np.degrees(np.arctan2(u, np.sqrt(max(0, 1 - u * u - v * v)))))
+        self._tx_settings["tx_azimuth"] = float(-np.degrees(np.arctan2(u, np.sqrt(max(0, 1 - u * u - v * v)))))
         self._tx_settings["tx_elevation"] = float(np.degrees(np.arcsin(v)))
         if hasattr(self, "txcontrol"):
             az, el = np.radians([self._tx_settings["tx_azimuth"], self._tx_settings["tx_elevation"]])
-            self.txcontrol.data["beams"][0].update(u=float(np.sin(az)*np.cos(el)), v=float(np.sin(el)))
+            self.txcontrol.data["beams"][0].update(u=float(-np.sin(az)*np.cos(el)), v=float(np.sin(el)))
             self._tx_settings["beams"] = copy.deepcopy(self.txcontrol.data["beams"][:self.txcontrol.data["count"]])
         self._queue_live_tx()
 
@@ -1116,6 +1232,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _finish_tx_operation(self, outcome):
         result, error = outcome
+        if error is None:
+            self._ensure_receive_board()
         for name in ("_doppler", "_sample_radar", "_doppler_indices", "_radar_capture_meta"):
             history = getattr(self, name, None)
             if history is not None:
@@ -1219,7 +1337,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     @PyQt6.QtCore.pyqtProperty(int, notify=traceSampleCountChanged)
     def traceSampleCount(self):
-        return self.fft_size
+        return CHUNK_SAMPLES if self._display_config.get("trigger", {}).get("mode") == "radar" else self.fft_size
 
     @PyQt6.QtCore.pyqtProperty(float, constant=True)
     def adcFullScale(self):
@@ -1341,6 +1459,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self._doppler_indices.clear()
         self._radar_capture_meta.clear()
         self.active_board = index
+        self._clear_receive_selection()
         self.boardSelectionChanged.emit()
         self._angle_estimate_deg = float("nan")
         self._elevation_estimate_deg = float("nan")
@@ -1504,8 +1623,30 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if spectrum.size == 0 or not np.all(np.isfinite(spectrum)):
             series.replace([])
             return
-        points = [PyQt6.QtCore.QPointF(-90.0 + index * 180.0 / max(1, spectrum.size - 1), float(value)) for index, value in enumerate(spectrum)]
+        points = [PyQt6.QtCore.QPointF(90.0 - index * 180.0 / max(1, spectrum.size - 1), float(value)) for index, value in enumerate(spectrum)]
         series.replace(points)
+
+    def _receive_cluster_ready(self, cluster):
+        boards = EspargosPulseRadarAnalyzer._receive_boards(self)
+        # Radar pulses must reach the selected aperture before the one-shot
+        # library callback fires. A fixed display delay cannot ensure this.
+        radar = getattr(self, "_display_config", {}).get("trigger", {}).get("mode") == "radar"
+        if len(boards) == 1 and not radar:
+            return True
+        if cluster.settled:
+            return True
+        # Keep this per-packet predicate small. Roles only change when a
+        # transmitter/selection changes, not when another antenna arrives.
+        tx = getattr(self, "radar_tx", None)
+        selection = tuple((b, tx.receivers(b) if tx else tuple(range(8))) for b in boards)
+        selection_key = (id(self.receiver), selection)
+        if selection_key != getattr(self, "_completion_selection_key", None):
+            cells = [(b, *self.receiver.boards[b].revision.antenna_id_to_row_col(a))
+                     for b, antennas in selection for a in antennas]
+            self._completion_selection = tuple(np.asarray(v, dtype=int) for v in zip(*cells))
+            self._completion_selection_key = selection_key
+        return bool(cluster.completion[self._completion_selection].all())
+
 
     def _on_iq_cluster(self, cluster):
         """Pool cluster callback (runs on the pool's processing thread; keep
@@ -1525,43 +1666,58 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         using ``chunk_index + lane`` on the unwrapped display grid.
         """
         with self._pending_lock:
-            cutoff = time.monotonic() - DISPLAY_SETTLE_SECONDS
+            # Radar callbacks already guarantee complete or settled packets.
+            # A second fixed wait only adds latency and merges ready batches.
+            radar = self._display_config.get("trigger", {}).get("mode") == "radar"
+            cutoff = time.monotonic() - (0 if radar else DISPLAY_SETTLE_SECONDS)
             count = 0
             while count < len(self._pending_clusters) and self._pending_clusters[count][0] <= cutoff:
                 count += 1
             clusters = self._pending_clusters[:count]
             del self._pending_clusters[:count]
 
-        # MULTI-BOARD GRID: this is the intentional board-selection boundary.
-        # For a measured joint aperture, retain all boards here with unique
-        # (board, antenna) keys, then supply positions in _angle_geometry.
-        board = self.active_board
-        if not clusters or board >= len(self.receiver.boards):
+        boards = EspargosPulseRadarAnalyzer._receive_boards(self)
+        if not clusters or any(b >= len(self.receiver.boards) for b in boards):
             return []
-        revision = self.receiver.boards[board].revision
-        positions = [revision.antenna_id_to_row_col(antenna_id) for antenna_id in range(SENSOR_COUNT)]
-        selected = [(antid, *positions[antid]) for antid in self._rx_sensor_ids()]
+        if len(boards) > 1 and EspargosPulseRadarAnalyzer._array_groups(self):
+            try:
+                self._angle_geometry()
+            except ValueError as error:
+                self._radar_status = self._angle_status = str(error)
+                self.radarStatusChanged.emit()
+                self.angleChanged.emit()
+                return []
+        selected = [(i*8+a, b, *self.receiver.boards[b].revision.antenna_id_to_row_col(a))
+                    for i,b in enumerate(boards) for a in (self.radar_tx.receivers(b) if getattr(self, "radar_tx", None) else range(8))]
+        positions = {channel: (b, r, c) for channel, b, r, c in selected}
         sets = []
         trigger = self._display_config.get("trigger", {})
         radar_batch = trigger.get("mode") == "radar"
         if radar_batch:
             if not hasattr(self, "_radar_batch_gate"):
-                self._radar_batch_gate = RadarBatchGate()
+                self._radar_batch_gate = RadarBatchGate(allow_partial_array=True, allow_partial_single=True)
             ready = None
             for arrived, cluster in clusters:
                 if isinstance(cluster, IQAccumCluster):
-                    batch = self._radar_batch_gate.feed(arrived, cluster, board,
-                        [(r, c) for _, r, c in selected], trigger)
+                    gate_board = boards[0] if len(boards) == 1 else boards
+                    gate_positions = ([(r, c) for _, _, r, c in selected] if len(boards) == 1
+                                      else [(b, r, c) for _, b, r, c in selected])
+                    batch = self._radar_batch_gate.feed(arrived, cluster, gate_board, gate_positions, trigger)
                     if batch is not None:
                         ready = batch
             if ready is None:
-                if self._radar_batch_gate.message:
+                cycle_seconds = (int(trigger["cycle_windows"]) * int(trigger["interval_chunks"])
+                                 * CHUNK_SAMPLES / max(self._spectrum_sample_rate_hz, 1))
+                if show_batch_message(self._radar_batch_gate.message,
+                                      getattr(self, "_radar_last_valid_frame", None),
+                                      time.monotonic(), cycle_seconds):
                     self._radar_status = self._radar_batch_gate.message
                     self.radarStatusChanged.emit()
                 return []
             clusters = ready
             # A Doppler observation must never bridge the streaming dead time.
             self._sample_radar.clear()
+            self._sample_radar.channels = 8*len(boards)
             self._radar_capture_meta.clear()
             self._doppler_indices.clear()
             self._doppler.clear()
@@ -1570,16 +1726,26 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             self._radar_batch_gate.reset()
 
         for arrived, cluster in clusters:
-            if not np.any(cluster.completion[board]):
-                # Controller generations are local to each board. A neighbor's
-                # accumulation window must not reset this board's display.
+            present = np.zeros_like(cluster.completion)
+            usable = None
+            if radar_batch and isinstance(cluster, IQAccumCluster):
+                usable = set(self._radar_batch_gate.usable_cells(cluster, [p[1:] for p in selected], trigger))
+            for _, board, row, col in selected:
+                present[board, row, col] = cluster.completion[board, row, col] and (usable is None or (board,row,col) in usable)
+            if not np.any(present) or (len(boards) > 1 and usable is None and not all(present[b, r, c] for _, b, r, c in selected)):
                 continue
             if isinstance(cluster, IQAccumCluster):
-                epoch = ("accum", tuple(np.unique(cluster.config_generation[board][cluster.completion[board]])))
+                epoch = ("accum", tuple(np.unique(cluster.config_generation[boards[0]][present[boards[0]]])) if len(boards) == 1 else tuple((b, tuple(np.unique(cluster.config_generation[b][present[b]]))) for b in boards))
+                if radar_batch:
+                    generation = self._radar_batch_gate.key[2]
+                    epoch = ("accum", generation if isinstance(generation, tuple) else (generation,))
             else:
-                present = np.zeros_like(cluster.completion)
-                present[board] = cluster.completion[board]
-                epoch = ("raw", int(cluster.sync_info[present][0]) & 0xFFFF, int(cluster.sample_rate_hz[present][0]), bool(cluster.flags[present][0] & 256))
+                epochs = np.unique(cluster.sync_info[present] & 0xFFFF)
+                rates = np.unique(cluster.sample_rate_hz[present])
+                centers = np.unique(cluster.center_freq_hz[present])
+                if len(epochs) != 1 or len(rates) != 1 or len(centers) != 1:
+                    continue
+                epoch = ("raw", int(epochs[0]), int(rates[0]), bool(cluster.flags[present][0] & 256))
             if epoch != self._display_epoch:
                 if arrived < self._display_epoch_time:
                     continue
@@ -1622,12 +1788,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 window = (cluster.source_chunk_end - cluster.source_chunk_start) & 0xFFFFFFFF
                 repeats = int(cluster.nominal_chunks)
                 for lane in range(cluster.vector_chunks):
-                    per = {antid: sections[board, row, col, lane] for antid, row, col in selected if completion[board, row, col, lane]}
+                    per = {antid: sections[board, row, col, lane] for antid, board, row, col in selected if completion[board, row, col, lane] and present[board,row,col]}
                     available = [positions[a] for a in per]
-                    lane_counts = [cluster.counts[board, row, col, lane] for row, col in available]
-                    lane_hashes = [cluster.coverage_hashes[board, row, col, lane] for row, col in available]
+                    lane_counts = [cluster.counts[board, row, col, lane] for board, row, col in available]
+                    lane_hashes = [cluster.coverage_hashes[board, row, col, lane] for board, row, col in available]
                     partial = (any(n != repeats for n in lane_counts) or len(set(lane_hashes)) > 1
-                               or any(int(cluster.flags[board, r, c, lane]) & 3 for r, c in available))
+                               or any(int(cluster.flags[board, r, c, lane]) & 3 for board, r, c in available))
                     layout = None if partial or not lane_hashes else accumulation_layout(
                         cluster.source_chunk_start, cluster.source_chunk_end,
                         cluster.vector_chunks, repeats, lane, lane_hashes[0])
@@ -1645,8 +1811,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                                 if partial else "Accumulated IQ received: source coverage cannot be identified from its fingerprint.")
                         self._radar_capture_meta[cluster.chunk_index + lane] = metadata
                     if lane == 0:
-                        counts = [cluster.counts[board, row, col, 0] for _, row, col in selected]
-                        hashes = [cluster.coverage_hashes[board, row, col, 0] for _, row, col in selected]
+                        counts = [cluster.counts[board, row, col, 0] for _, board, row, col in selected]
+                        hashes = [cluster.coverage_hashes[board, row, col, 0] for _, board, row, col in selected]
                         if counts and counts[0] > 0 and len(set(counts)) == 1 and len(set(hashes)) == 1:
                             self._doppler_indices[cluster.chunk_index] = window
                     if per:
@@ -1654,7 +1820,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             else:
                 completion = cluster.completion
                 iq = cluster.iq
-                per = {antid: iq[board, row, col] for antid, row, col in selected if completion[board, row, col]}
+                per = {antid: iq[board, row, col] for antid, board, row, col in selected if completion[board, row, col]}
                 if per:
                     self._radar_capture_meta[cluster.chunk_index] = dict(count=1, step=0, capture=None, partial=False)
                     trigger = self._display_config.get("trigger", {})
@@ -1707,10 +1873,12 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         window joins adjacent chunks crossing a render tick. Retire blocks in
         index order, once only; late data cannot create duplicate grey rows.
         """
-        B = self.fft_size // CHUNK_SAMPLES
         config = self._display_config
         trigger = config.get("trigger", {})
-        schedule = tuple(trigger[k] for k in ("interval_chunks", "offset_chunks", "burst_chunks")) if trigger.get("mode") == "interval" else None
+        # Radar profiles are independent 256-sample observations separated by
+        # the PRI. Never concatenate those gaps into a fictitious long trace.
+        B = 1 if trigger.get("mode") == "radar" else self.fft_size // CHUNK_SAMPLES
+        schedule = tuple(trigger.get(k, default) for k, default in (("interval_chunks", 1), ("offset_chunks", 0), ("burst_chunks", 1))) if trigger.get("mode") == "interval" else None
         if schedule != self._display_schedule:
             self._display_schedule = schedule
             self.block_acc.clear()
@@ -1726,6 +1894,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         if (self.display_mode == "doppler" and trigger.get("mode") == "radar"
                 and (not self.remove_los or self._clutter_mode == "zero_doppler")):
             calibrated_batch = self._angle_corrected_batch(sets)
+        if self.display_mode == "doppler" and not self._sample_radar.records:
+            self._sample_radar.channels = EspargosPulseRadarAnalyzer._processing_channels(self)
         for idx, per in sets:
             self._doppler_indices.pop(idx, None)
             metadata = self._radar_capture_meta.pop(idx, None)
@@ -1818,11 +1988,15 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
             window = np.zeros((SENSOR_COUNT, self.fft_size), dtype=np.complex64)
             for a in range(SENSOR_COUNT):
                 if present[a]:
-                    window[a] = np.concatenate([block[a][k] for k in range(B)])
+                    values = np.concatenate([block[a][k] for k in range(B)])
+                    window[a, :len(values)] = values
             windows.append(window)
             masks.append(present)
         if windows:
-            spectra = np.fft.fftshift(np.fft.fft(np.asarray(windows) * self._win, axis=-1), axes=-1)
+            length = min(self.fft_size, B*CHUNK_SAMPLES)
+            taper = self._win if length == self.fft_size else np.pad(np.hanning(length), (0, self.fft_size-length))
+            scale = max(float(np.sum(taper))*ADC_FULL_SCALE, 1.0)
+            spectra = np.fft.fftshift(np.fft.fft(np.asarray(windows) * taper, axis=-1), axes=-1)
             masks = np.asarray(masks)
             if mode == "phase":
                 reference_id = next(iter(self._rx_sensor_ids()), 0)
@@ -1836,7 +2010,7 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                 pixels = (PHASE_MAPPER.cmap(PHASE_MAPPER.norm(np.angle(pooled))) * 255).astype(np.uint8)
                 masks &= masks[:, reference_id : reference_id + 1].copy()
             else:
-                db = 20 * np.log10(np.maximum(np.abs(spectra) / self._fft_scale, 1e-12))
+                db = 20 * np.log10(np.maximum(np.abs(spectra) / scale, 1e-12))
                 pixels = power_db_row(db, self.display_width, DB_MIN, DB_MAX)
             pixels[~masks] = self._placeholder_row()
             for a in range(SENSOR_COUNT):
@@ -1864,16 +2038,18 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
                     continue
                 slot = max(slots)
                 chosen = {antid: samples[slot] for antid, samples in block.items() if slot in samples}
+                if len(EspargosPulseRadarAnalyzer._receive_boards(self)) > 1 and not EspargosPulseRadarAnalyzer._spatial_coverage_ready(self, chosen):
+                    chosen = None
+                    continue
                 break
             if mode == "angle":
-                # Angle processing must see one synchronized chunk.
-                if not self._rx_sensor_ids() or not set(self._rx_sensor_ids()).issubset(block):
+                # Use one timestamp and preserve the physical positions of
+                # missing elements; never pack surviving antennas together.
+                slots = sorted(set().union(*(set(samples) for samples in block.values())), reverse=True)
+                candidates = ({a: samples[slot] for a,samples in block.items() if slot in samples} for slot in slots)
+                chosen = next((traces for traces in candidates if EspargosPulseRadarAnalyzer._spatial_coverage_ready(self, traces)), None)
+                if chosen is None:
                     continue
-                common_slots = set.intersection(*(set(block[antid].keys()) for antid in self._rx_sensor_ids()))
-                if not common_slots:
-                    continue
-                slot = max(common_slots)
-                chosen = {antid: block[antid][slot] for antid in self._rx_sensor_ids()}
                 break
 
             traces = {antid: np.concatenate([slots[k] for k in range(B)]) for antid, slots in block.items() if len(slots) == B}
@@ -1893,6 +2069,16 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _update_display_config(self, config):
         self._display_config = {**self._display_config, **config}
+        receiver = getattr(self, "receiver", None)
+        if receiver is not None:
+            if not hasattr(self, "_normal_settle_timeout"):
+                self._normal_settle_timeout = getattr(receiver, "chunk_settle_timeout", 15.0)
+            # Bound missing-packet latency in this application only. Preserve
+            # the framework's normal behavior for other trigger modes.
+            if hasattr(receiver, "_expire_cluster_caches"):
+                configure_radar_maintenance(receiver, self._display_config.get("trigger", {}).get("mode") == "radar")
+            receiver.chunk_settle_timeout = 1.5 if self._display_config.get("trigger", {}).get("mode") == "radar" else self._normal_settle_timeout
+        self.traceSampleCountChanged.emit()
 
     def _synchronize_radar(self):
         """The central button calibrates the requested roles, even with TX stopped."""
@@ -1967,6 +2153,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
 
     def _finish_radar_calibration(self, outcome):
         reference, cfg, resume, error = outcome
+        if error is None:
+            self._ensure_receive_board()
         if resume and reference is not None:
             self._tx_waveform, self._active_ping_config = reference, cfg
             self.appconfig.set(cfg)
@@ -1995,10 +2183,10 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         self.iqcontrol.configChanged.connect(self._update_display_config)
         self.iqcontrol.set_apply_calibration(bool(self.appconfig.get("apply_calibration")))
         self.engine.rootContext().setContextProperty("iqcontrol", self.iqcontrol)
-        # Observe each cluster from its first arrival; the display has its own
-        # bounded settling window, independent of calibration/library consumers.
-        self.receiver.add_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
-        self.receiver.add_accumulation_callback(self._on_iq_cluster, callback_predicate=lambda cluster: True)
+        # Radar callbacks wait for the selected RX aperture or settled partial
+        # data; ordinary modes retain their first-arrival display behavior.
+        self.receiver.add_callback(self._on_iq_cluster, callback_predicate=self._receive_cluster_ready)
+        self.receiver.add_accumulation_callback(self._on_iq_cluster, callback_predicate=self._receive_cluster_ready)
 
         self._tx_settings["tx_sensors"] = [f"{self.pool.names[b]}.{a}" for b, a in sorted(self.radar_tx.selected)]
         self.txStateChanged.emit()
@@ -2049,6 +2237,8 @@ class EspargosPulseRadarAnalyzer(CombinedArrayMixin, ESPARGOSIQApplication):
         worker = getattr(self, "_render_worker", None)
         if worker is not None:
             worker.join()
+        if hasattr(self, "_sample_radar"):
+            self._sample_radar.close()
         try:
             try:
                 self._stop_ping_tx()

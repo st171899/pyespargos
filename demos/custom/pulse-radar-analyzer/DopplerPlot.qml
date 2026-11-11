@@ -25,15 +25,11 @@ Rectangle {
             Layout.fillHeight: true
             Layout.leftMargin: Math.max(90, rangeMeasure.implicitWidth + 12)
             Layout.bottomMargin: 50
-            Image {
+            RetainedTexture {
                 id: samples
                 objectName: "dopplerTexture"
                 width: Math.max(1, backend.angleSize)
                 height: Math.max(1, backend.delaySize)
-                cache: false
-                asynchronous: true
-                // Keep the shader's previous texture until the new image is ready.
-                retainWhileLoading: true
                 source: "image://dopplermap/" + backend.dopplerFrame
             }
             ShaderEffect {

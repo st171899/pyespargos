@@ -83,6 +83,7 @@ def _reference_session(pool, center_hz=None, rx_gain=None, scope=None):
     """Restore each board's settings on every exit, including failed acquisition."""
     from .scope import CalibrationScope
 
+    pool.validate_reference_roles()
     scope = scope or CalibrationScope(pool)
     saved = _map(lambda b: b.iq.get_config(), pool.boards)
     bi, a = scope.pairs[0]

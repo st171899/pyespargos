@@ -152,6 +152,11 @@ class TXSignals:
             if not isinstance(signal.steering, Beamspace):
                 continue
             members = set(signal.antennas)
+            geometry = tx.owner._geometry
+            if geometry.groups:
+                hosts = {a.host for a in members}
+                if not any(hosts <= {geometry.hosts[i] for i in g["boards"]} for g in geometry.groups.values()):
+                    raise ValueError("A geometric transmit beam must stay within one physical aperture group")
             if antennas is not None and not members.intersection(antennas):
                 continue
             # Waveforms are normally prepared before the first calibration.

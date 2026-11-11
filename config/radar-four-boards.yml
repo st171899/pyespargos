@@ -1,0 +1,68 @@
+# Physical architecture only. Select transmit and receive apertures in the UI.
+combined-array:
+  boards:
+    myspargel:
+      host: 10.42.0.35
+      cable:
+        length: 2.0
+        velocity_factor: 0.76
+    second:
+      host: 10.42.0.204
+      cable:
+        length: 2.0
+        velocity_factor: 0.76
+    third:
+      host: 10.42.0.203
+      cable:
+        length: 2.0
+        velocity_factor: 0.76
+    fourth:
+      host: 10.42.0.55
+      cable:
+        length: 2.0
+        velocity_factor: 0.76
+  reference-master: myspargel
+  primary-group: array6x4
+  groups:
+    single:
+      boards:
+      - myspargel
+      array:
+      - - myspargel.0.0
+        - myspargel.0.1
+        - myspargel.0.2
+        - myspargel.0.3
+      - - myspargel.1.0
+        - myspargel.1.1
+        - myspargel.1.2
+        - myspargel.1.3
+    array6x4:
+      boards:
+      - second
+      - third
+      - fourth
+      array:
+      - - second.1.0
+        - second.0.0
+        - third.1.0
+        - third.0.0
+        - fourth.1.0
+        - fourth.0.0
+      - - second.1.1
+        - second.0.1
+        - third.1.1
+        - third.0.1
+        - fourth.1.1
+        - fourth.0.1
+      - - second.1.2
+        - second.0.2
+        - third.1.2
+        - third.0.2
+        - fourth.1.2
+        - fourth.0.2
+      - - second.1.3
+        - second.0.3
+        - third.1.3
+        - third.0.3
+        - fourth.1.3
+        - fourth.0.3

@@ -84,6 +84,13 @@ def accumulation_layout(source_start, source_end, vector, nominal, lane, coverag
     return None
 
 
+@lru_cache(maxsize=32)
+def _slow_time_transform(size, bins, step, dt, first_frequency):
+    from scipy.signal import CZT
+    return CZT(size, m=bins, w=np.exp(-2j*np.pi*step*dt),
+               a=np.exp(2j*np.pi*first_frequency*dt))
+
+
 def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancelled=None):
     """Timestamped pulse-phase transform, using short regular burst lattices.
 
@@ -92,8 +99,6 @@ def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancel
     in each small burst-phase lattice have zero weight, not synthetic data.
     Irregular schedules/nonuniform frequency grids use an exact tiled DFT.
     """
-    from scipy.signal import CZT
-
     profiles = np.asarray(profiles, np.complex64)
     frequencies = np.asarray(frequencies, np.float64)
     times = np.asarray(times, np.float64)
@@ -126,8 +131,7 @@ def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancel
         transforms = {}
         for ids, slots, size, first in groups:
             if size not in transforms:
-                transforms[size] = CZT(size,m=len(frequencies),
-                    w=np.exp(-2j*np.pi*step*dt),a=np.exp(2j*np.pi*frequencies[0]*dt))
+                transforms[size] = _slow_time_transform(size, len(frequencies), float(step), float(dt), float(frequencies[0]))
             transform = transforms[size]
             rotation = np.exp(-2j*np.pi*frequencies*first)
             for begin in range(0,profiles.shape[-1],64):
@@ -136,7 +140,10 @@ def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancel
                 time.sleep(0)
                 end = min(begin+64,profiles.shape[-1])
                 grid = np.zeros((size,profiles.shape[1],end-begin),np.complex64)
-                np.add.at(grid,slots,profiles[ids,:,begin:end])
+                if len(np.unique(slots)) == len(slots):
+                    grid[slots] = profiles[ids,:,begin:end]
+                else:
+                    np.add.at(grid,slots,profiles[ids,:,begin:end])
                 result[:,:,begin:end] += transform(grid,axis=0)*rotation[:,None,None]
         return result
     for begin in range(0,len(frequencies),16):
@@ -150,18 +157,35 @@ def slow_time_spectrum(profiles, times, frequencies, sample_rate, period, cancel
 
 class SampleRadar:
     """Bounded raw/averaged chunk history with exact source sample positions."""
-    def __init__(self, size=64):
+    def __init__(self, size=64, offload=False):
         self.size = int(size)
+        self._worker = None
+        if offload:
+            from radar_worker import RadarMapWorker
+            self._worker = RadarMapWorker()
         self.records = OrderedDict()
+        self.channels = 8
+
+    def close(self):
+        if self._worker is not None:
+            self._worker.close()
 
     def clear(self):
         self.records.clear()
+        self.channels = 8
 
     def append(self, index, traces, *, count=1, step=0, capture=None, partial=False):
         if self.records and index < next(iter(self.records)) and len(self.records) >= self.size:
             return False
-        data = np.zeros((8, 256), np.complex64)
-        valid = np.zeros((8, 256), bool)
+        channels = max([self.channels] + [int(a)+1 for a in traces])
+        if channels != self.channels:
+            for key, record in list(self.records.items()):
+                data, valid, *meta = record
+                pad = ((0, channels-self.channels), (0, 0))
+                self.records[key] = (np.pad(data, pad), np.pad(valid, pad), *meta)
+            self.channels = channels
+        data = np.zeros((self.channels, 256), np.complex64)
+        valid = np.zeros((self.channels, 256), bool)
         for antenna, trace in traces.items():
             values = np.asarray(trace, np.complex64).reshape(-1)[:256]
             finite = np.isfinite(values)
@@ -249,9 +273,9 @@ class SampleRadar:
                 length = min(period-phase, 256-offset)
                 key = (group, count, step, pulse)
                 if key not in rows:
-                    if (len(rows)+1)*8*period > 8_388_608:
+                    if (len(rows)+1)*self.channels*period > 8_388_608:
                         raise ValueError("Replay/history combination is too large; reduce history chunks/lanes or replay length.")
-                    rows[key] = (np.zeros((8, period), np.complex64), np.zeros((8, period), bool))
+                    rows[key] = (np.zeros((self.channels, period), np.complex64), np.zeros((self.channels, period), bool))
                 values, mask = rows[key]
                 values[:, phase:phase+length] = data[:, offset:offset+length]
                 mask[:, phase:phase+length] = valid[:, offset:offset+length]
@@ -280,6 +304,11 @@ class SampleRadar:
         across chunks are joined; multiple pulses per chunk stay separate.
         No trial-velocity phase correction is applied within a pulse.
         """
+        if self._worker is not None:
+            return self._worker.maps(self,
+                (reference, sample_rate, frequency, velocities, delays, geometry),
+                dict(mode=mode, window=window, suppress=suppress, max_age=max_age, spacing_m=spacing_m),
+                cancelled)
         if mode not in ('coherent','bursts') or window not in ('hann','rectangular'):
             raise ValueError('Unknown Doppler strategy or time window')
         if sample_rate <= 0 or frequency <= 0:
@@ -300,7 +329,17 @@ class SampleRadar:
         reference_fft = np.fft.fft(reference)
         # These range FFTs are independent of velocity and run once per pulse.
         correlations = np.fft.ifft(np.fft.fft(data*valid)*reference_fft.conj())[:,:,delays]
-        energy = np.maximum(np.fft.ifft(np.fft.fft(valid)*np.fft.fft(abs(reference)**2).conj()).real,0)[:,:,delays]
+        # Radar profiles contain a whole valid period or a missing antenna.
+        # Their matched-filter energy is constant over delay; avoid two FFTs
+        # over every pulse/channel just to recover that constant. Arbitrary
+        # partial raw chunks still use the exact per-delay energy calculation.
+        whole = valid.all(axis=-1)
+        empty = ~valid.any(axis=-1)
+        if np.all(whole | empty):
+            energy = np.broadcast_to(whole[:, :, None] * float(np.vdot(reference, reference).real),
+                                     correlations.shape).copy()
+        else:
+            energy = np.maximum(np.fft.ifft(np.fft.fft(valid)*np.fft.fft(abs(reference)**2).conj()).real,0)[:,:,delays]
         energy[energy < max(float(np.vdot(reference,reference).real)*1e-7,1e-12)] = 0
         correlations = np.where(energy > 0,correlations,0)
         centers = times+(period-1)/(2*sample_rate)+np.asarray([(k[1]-1)*k[2]/(2*sample_rate) for k in keys])
@@ -324,7 +363,7 @@ class SampleRadar:
                     out=np.zeros_like(denominator,dtype=np.complex128),where=denominator>1e-12)
                 values = values-mean[None]*energy[ids]
             weighted = (values*taper[:,None,None]).astype(np.complex64)
-            numerator = np.zeros((len(velocities),8,len(delays)),np.complex128)
+            numerator = np.zeros((len(velocities),self.channels,len(delays)),np.complex128)
             integrations = sorted(set((keys[i][1],keys[i][2]) for i in ids))
             for count,step in integrations:
                 local = np.asarray([keys[i][1:3]==(count,step) for i in ids])

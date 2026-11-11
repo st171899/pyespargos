@@ -76,7 +76,7 @@ ColumnLayout {
         onClicked: backend.txController.setSetting("unlocked", checked)
     }
     Label { text: "Beam 1 supplies the receive matched-filter reference. Amplitude is applied once. Chirp bandwidth, sample count, delay and repetition also control the preview."; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-    TX.IQTxBeamEditor {
+    RadarBeamEditor {
         id: beamEditor
         controller: backend.txController
         steeringFirst: true
@@ -94,6 +94,23 @@ ColumnLayout {
         enabled: !backend.initializing && !backend.txBusy
         ColumnLayout {
             anchors.fill: parent
+            Repeater {
+                model: backend.apertureGroups
+                CheckBox {
+                    required property var modelData
+                    text: modelData.name + " · " + modelData.antennas + " antennas"
+                    tristate: true
+                    checkState: {
+                        let selected = 0;
+                        for (let b of modelData.boards)
+                            for (let a = 0; a < 8; ++a)
+                                if (backend.txSettings.tx_sensors.indexOf(b + "." + a) >= 0) ++selected;
+                        return selected === 0 ? Qt.Unchecked : (selected === modelData.antennas ? Qt.Checked : Qt.PartiallyChecked);
+                    }
+                    nextCheckState: function() { return checkState === Qt.Checked ? Qt.Unchecked : Qt.Checked; }
+                    onClicked: backend.setTxGroup(modelData.name, checkState === Qt.Checked)
+                }
+            }
             Repeater {
                 model: backend.txBoardNames
                 ColumnLayout {

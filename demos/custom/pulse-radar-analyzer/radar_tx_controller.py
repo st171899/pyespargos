@@ -22,7 +22,7 @@ class RadarTxController(IQTxController):
         for beam in self.data["beams"]:
             beam.update(type="lfm", start_mhz=-20, stop_mhz=20, duration_us=0.2, delay_samples=0, duration_samples=16, amplitude=10**(radar._tx_settings["tx_gain_db"]/20))
         az, el = np.radians([radar._tx_settings["tx_azimuth"], radar._tx_settings["tx_elevation"]])
-        self.data["beams"][0].update(u=float(np.sin(az)*np.cos(el)), v=float(np.sin(el)), squint=radar._tx_settings["tx_squint"])
+        self.data["beams"][0].update(u=float(-np.sin(az)*np.cos(el)), v=float(np.sin(el)), squint=radar._tx_settings["tx_squint"])
         radar._tx_settings["beams"] = copy.deepcopy(self.data["beams"][:1])
         self.data["monitor_enabled"] = False
         self.poll.stop()
@@ -114,7 +114,7 @@ class RadarTxController(IQTxController):
         first = self.data["beams"][0]
         self.radar._tx_settings["tx_gain_db"] = float(20*np.log10(max(first["amplitude"], 1e-6)))
         u, v = first["u"], first["v"]
-        self.radar._tx_settings.update(tx_azimuth=float(np.degrees(np.arctan2(u, np.sqrt(max(0, 1-u*u-v*v))))),
+        self.radar._tx_settings.update(tx_azimuth=float(-np.degrees(np.arctan2(u, np.sqrt(max(0, 1-u*u-v*v))))),
                                        tx_elevation=float(np.degrees(np.arcsin(np.clip(v, -1, 1)))), tx_squint=first["squint"])
         files = [(i, b["file"]) for i, b in enumerate(self.data["beams"][:self.data["count"]]) if b["type"] == "file" and b["file"]]
         if files and "waveform" in kinds:

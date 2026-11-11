@@ -713,19 +713,43 @@ class IQReceiver(ClusterAssembler):
 
     @property
     def master_index(self) -> int:
-        """Index of the master board — the one whose reference TX may generate
-        the shared reference (wificonf calib-mode != Never); kit slaves are
-        Never. Autodetected on first access unless given to the constructor."""
+        """Reference master, selected by live calib-source rather than board order.
+
+        Legacy standalone internal-reference boards remain supported. Grouped
+        calibrations additionally validate the live routing on every run.
+        """
         if self._master_index is None:
-            self._master_index = 0
+            candidates = []
             for i, board_obj in enumerate(self.boards):
                 try:
-                    if int(board_obj.wifi_rx.get_config().get("calib-mode", 0)) != 0:
+                    config = board_obj.wifi_rx.get_config()
+                    source = int(config.get("calib-source", 0))
+                    if source == 1:
                         self._master_index = i
                         break
+                    if source == 0 and int(config.get("calib-mode", 0)) != 0:
+                        candidates.append(i)
                 except Exception:
                     continue
+            if self._master_index is None:
+                if not candidates:
+                    raise ValueError("No reference master in pool; include the master and set reference-master")
+                self._master_index = candidates[0]
         return self._master_index
+
+    def validate_reference_roles(self):
+        """Check current hardware routing before calibration of grouped apertures."""
+        geometry = self._owner._geometry if hasattr(self, "_owner") else None
+        if geometry is None or not geometry.groups:
+            return
+        sources = [int(b.wifi_rx.get_config().get("calib-source", 0)) for b in self.boards]
+        masters = [i for i, source in enumerate(sources) if source == 1]
+        if len(masters) != 1 or any(source not in (1, 2) for source in sources):
+            raise ValueError("Grouped calibration requires one live master and all other boards configured as slaves")
+        live = masters[0]
+        if geometry.reference_master is not None and self.boards[live].host != geometry.hosts[geometry.names.index(geometry.reference_master)]:
+            raise ValueError("Configured reference master differs from live board master/slave settings")
+        self._master_index = live
 
     @property
     def master_board(self):

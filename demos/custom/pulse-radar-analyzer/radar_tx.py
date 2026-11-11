@@ -78,18 +78,27 @@ def reset_radar_boards(pool, timeout=10):
 
 
 def calibrate_radar_timing(pool, transmitters, path, logger):
-    """Use MIMO's timing probes, increasing gain for weak inter-board links."""
+    """Measure checked timing probes, adapting gain for weak or clipping paths."""
     kwargs = {"path": path}
     if path != "reference":
         transmitters = set(transmitters)
         kwargs["reference_delays_s"] = air_path_delays(transmitters, set(pool.antennas) - transmitters)
-    for gain in (24, 42):
+    gain, attempted = 24, set()
+    while gain not in attempted:
+        attempted.add(gain)
         try:
             return pool.calibrate_tx_rx_delay(**kwargs, rx_gain=gain)
         except TxRxDelayMeasurementError as error:
-            if gain == 42 or error.reason not in ("weak", "unstable"):
+            if error.reason == "clipped":
+                next_gain = max(0, gain-6)
+            elif error.reason in ("weak", "unstable"):
+                next_gain = 42
+            else:
                 raise
-            logger.info("TX/RX timing probe was %s at %s dB RX gain; retrying at 42 dB", error.reason, gain)
+            if next_gain in attempted:
+                raise
+            logger.info("TX/RX timing probe was %s at %s dB RX gain; retrying at %s dB", error.reason, gain, next_gain)
+            gain = next_gain
 
 
 def configure_receivers(pool, config):
@@ -157,8 +166,18 @@ class RadarTransmitter:
         self.selected = selected
         self.antennas = [Antenna(pool.hosts[b], a) for b, a in sorted(selected)]
 
+    @property
+    def selected(self):
+        return self._selected
+
+    @selected.setter
+    def selected(self, value):
+        self._selected = frozenset(value)
+        self._receivers = tuple(tuple(a for a in range(8) if (b,a) not in self._selected)
+                                for b in range(len(self.pool.names)))
+
     def receivers(self, board):
-        return tuple(a for a in range(8) if (board, a) not in self.selected)
+        return self._receivers[board]
 
     def configure(self):
         args = self.args
@@ -253,8 +272,9 @@ class RadarTransmitter:
 
         beams = getattr(self.args, "beams", None)
         if not beams:
+            # UI azimuth is positive screen-right; library u is positive screen-left.
             az, el = np.radians([self.args.tx_azimuth, self.args.tx_elevation])
-            beams = [dict(u=np.sin(az)*np.cos(el), v=np.sin(el), squint=self.args.tx_squint, amplitude=1)]
+            beams = [dict(u=-np.sin(az)*np.cos(el), v=np.sin(el), squint=self.args.tx_squint, amplitude=1)]
         editor = getattr(self.args, "waveform_editor", False)
         samples = getattr(self.args, "samples", 256)
         from radar_waveform import replay_samples, prepare_source

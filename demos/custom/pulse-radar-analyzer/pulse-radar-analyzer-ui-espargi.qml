@@ -361,8 +361,7 @@ Common.ESPARGOSApplication {
 		}
 	}
 
-	/** 2x4 antenna displays, front view; one tab per board on multi-board
-	    coherent arrays (only the active board is rendered) **/
+	/** Individual board views; spatial and Doppler modes use all RX antennas. **/
 	ColumnLayout {
 		anchors.fill: parent
 		anchors.margins: 10
@@ -372,7 +371,7 @@ Common.ESPARGOSApplication {
 			id: boardTabs
             objectName: "receiveBoardTabs"
             currentIndex: backend.activeBoard
-			visible: backend.boardCount > 1
+			visible: backend.boardCount > 1 && !backend.angleMode && !backend.radarMode
 			Layout.fillWidth: true
 			z: 20
 			onCurrentIndexChanged: backend.set_active_board(currentIndex)
@@ -380,7 +379,7 @@ Common.ESPARGOSApplication {
 				model: backend.boardCount
 				TabButton {
 					required property int index
-					text: "Receive board " + (index + 1) + "  ·  " + backend.boardHosts[index]
+					text: backend.boardRoleLabels[index] || ("Board " + (index + 1) + " · " + backend.boardHosts[index])
 				}
 			}
 		}
@@ -702,6 +701,8 @@ Common.ESPARGOSApplication {
 
 					ChartView {
 						id: angleChart
+                        objectName: "radarAngleChart"
+                        property alias horizontalAxis: angleAxis
 						Layout.fillWidth: true
 						Layout.fillHeight: true
 						Layout.minimumHeight: 260
@@ -713,6 +714,8 @@ Common.ESPARGOSApplication {
 
 						ValueAxis {
 							id: angleAxis
+                            objectName: "radarAngleAxis"
+                            reverse: false
 							min: -90
 							max: 90
 							tickCount: 7
@@ -797,7 +800,7 @@ Common.ESPARGOSApplication {
 
 					Label {
 						Layout.alignment: Qt.AlignHCenter
-						text: "2D Range-Azimuth Radar Mapping View"
+						text: "Range–horizontal angle"
 						color: "#ffffff"
 						font.pixelSize: 20
 						font.bold: true
@@ -811,15 +814,12 @@ Common.ESPARGOSApplication {
 
 						// Keep the source texture at the backend data resolution.
 						// ShaderEffectSource hides it from the window without fading it.
-                        Image {
+                        RetainedTexture {
                             id: plotCanvas
                             objectName: "radarTexture"
                             width: Math.max(1, backend.angleSize)
                             height: Math.max(1, backend.delaySize)
-                            cache: false
-                            asynchronous: true
                             // Loading a replacement must not blank the live shader.
-                            retainWhileLoading: true
                             source: "image://radarmap/" + backend.radarFrame
                         }
 
@@ -955,7 +955,7 @@ Common.ESPARGOSApplication {
 									context.stroke();
 
 									if (i % 3 !== 0) continue;
-                                    let angleText = (180 / phi_num * (-i)) + "°";
+                                    let angleText = (180 / phi_num * i) + "°";
 									context.fillStyle = text_color;
 
 									if (i < 0) {
